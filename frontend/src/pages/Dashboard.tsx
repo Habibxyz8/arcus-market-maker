@@ -1,36 +1,56 @@
+import { useEffect, useState } from 'react'
 import StatusCard from '../components/StatusCard'
 import TradingModeBadge from '../components/TradingModeBadge'
+import VolumeCard from '../components/VolumeCard'
+import PnLCards from '../components/PnLCards'
+import RiskDashboard from '../components/RiskDashboard'
+import OrderTable from '../components/OrderTable'
+import FillTable from '../components/FillTable'
+import BotControls from '../components/BotControls'
+import DashboardCharts from '../charts/DashboardCharts'
+import Settings from './Settings'
+import { api } from '../services/api'
+
+function MainStats(){
+  const [s,setS]=useState<any>(null)
+  useEffect(()=>{
+    const f=async()=>{ try{setS(await api.analyticsStatus())}catch{}}
+    f(); const id=setInterval(f,2000); return()=>clearInterval(id)
+  },[])
+  if(!s) return <div className="p-5 bg-slate-900 border border-slate-800 rounded-2xl">Loading…</div>
+  return (
+    <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+      {[
+        ['Market', s.market],['Bid', s.bid? Number(s.bid).toFixed(2):'—'],['Ask', s.ask? Number(s.ask).toFixed(2):'—'],['Mid', s.mid? Number(s.mid).toFixed(2):'—'],
+        ['Spread', s.spread? Number(s.spread).toFixed(4):'—'],['Spread bps', s.spread_bps? Number(s.spread_bps).toFixed(1):'—'],['Inventory', Number(s.inventory).toFixed(4)],['Exposure', `$${Number(s.exposure).toFixed(2)}`],
+        ['Open Orders', String(s.open_orders)],['Volume', `$${Number(s.volume).toFixed(2)}`],['PnL', `$${Number(s.net_pnl).toFixed(2)}`],['Fees', `$${Number(s.fees).toFixed(4)}`],
+      ].map(([k,v])=>(
+        <div key={k} className="p-3 bg-slate-900 border border-slate-800 rounded-xl"><div className="text-xs text-slate-400 uppercase tracking-widest">{k}</div><div className="text-sm font-bold mt-1">{String(v)}</div></div>
+      ))}
+    </div>
+  )
+}
 
 export default function Dashboard() {
   return (
     <div className="min-h-screen p-6 max-w-7xl mx-auto space-y-6">
       <header className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold tracking-tight">Arcus Market Maker <span className="text-slate-500 font-normal">· Phase 4</span></h1>
+        <h1 className="text-2xl font-bold tracking-tight">Arcus Market Maker <span className="text-slate-500 font-normal">· Legit liquidity</span></h1>
         <TradingModeBadge />
       </header>
 
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-        <StatusCard />
-        <div className="p-5 bg-slate-900 border border-slate-800 rounded-2xl">
-          <div className="text-xs uppercase tracking-widest text-slate-400">$1M Target</div>
-          <div className="text-2xl font-bold mt-1">— <span className="text-slate-500 text-base font-normal">(Phase 24)</span></div>
-          <div className="text-sm text-slate-400 mt-1">Volume tracking wired in Phases 21-25</div>
-        </div>
-        <div className="p-5 bg-slate-900 border border-slate-800 rounded-2xl">
-          <div className="text-xs uppercase tracking-widest text-slate-400">PnL</div>
-          <div className="text-2xl font-bold mt-1">— <span className="text-slate-500 text-base font-normal">(Phase 25)</span></div>
-          <div className="text-sm text-slate-400 mt-1">Gross / Fees / Net (Phase 13-15)</div>
-        </div>
+      <BotControls />
+      <MainStats />
+      <VolumeCard />
+      <PnLCards />
+      <DashboardCharts />
+      <RiskDashboard />
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <OrderTable />
+        <FillTable />
       </div>
-
-      <div className="p-5 bg-slate-900 border border-slate-800 rounded-2xl">
-        <div className="text-sm font-semibold">Next steps</div>
-        <ul className="list-disc ml-5 mt-2 text-sm text-slate-300 space-y-1">
-          <li>Backend at <code className="bg-slate-800 px-1 rounded">http://localhost:8000</code> — <code>/api/health</code>, <code>/api/bot/*</code>, <code>/api/ws/dashboard</code></li>
-          <li>Phases 6-7 Arcus REST/WS client (official docs only), Phases 8-20 strategy/risk</li>
-          <li>Dark dashboard phases 26-34 expand after market data engine</li>
-        </ul>
-      </div>
+      <Settings />
+      <div className="text-xs text-slate-500 text-center">PAPER default · LIVE gated · No wash trading · No fake volume · DMS + Emergency Stop</div>
     </div>
   )
 }
