@@ -72,7 +72,10 @@ class Settings(BaseSettings):
     @classmethod
     def _coerce_mode(cls, v: object) -> object:
         if isinstance(v, str):
-            return v.upper()
+            upper = v.upper().strip()
+            if upper not in ("PAPER", "TESTNET", "LIVE"):
+                raise ValueError(f"TRADING_MODE must be PAPER|TESTNET|LIVE, got {v!r}")
+            return upper
         return v
 
     @property
@@ -82,6 +85,10 @@ class Settings(BaseSettings):
     @property
     def is_paper(self) -> bool:
         return self.trading_mode == TradingMode.PAPER
+
+    @property
+    def is_testnet(self) -> bool:
+        return self.trading_mode == TradingMode.TESTNET
 
     @property
     def active_rest_url(self) -> str:

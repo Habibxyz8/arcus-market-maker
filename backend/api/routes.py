@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from backend.config.settings import settings
 from backend.models.schemas import BotStatusResponse, HealthResponse, MarketSnapshot, StartRequest
 from backend.monitoring.logger import BOT_STARTED, BOT_STOPPED, EMERGENCY_STOP, get_logger
+from backend.services.trading_mode import describe_mode, require_not_emergency, validate_live_start
 
 log = get_logger(__name__)
 router = APIRouter()
@@ -34,19 +35,27 @@ async def bot_status() -> BotStatusResponse:
     )
 
 
+@router.get("/config/mode")
+async def config_mode() -> JSONResponse:
+    return JSONResponse(describe_mode())
+
+
 @router.post("/bot/start")
 async def bot_start(req: StartRequest) -> JSONResponse:
-    if settings.is_live and not req.confirm_live:
-        raise HTTPException(status_code=400, detail="LIVE mode requires confirm_live=true")
-    if _state["emergency"]:
-        raise HTTPException(status_code=409, detail="Emergency stop active - reset required")
+    require_not_emergency(bool(_state["emergency"]))
+    validate_live_start(req.confirm_live)
+    # Paper/testnet also require credentials check only for live/testnet real trading
+    if settings.trading_mode in ("LIVE", "TESTNET") and not settings.has_credentials():  # type: ignore[comparison-overlap]
+        # Allow start but warn - real order path will block in Phase 19
+        log.warning("Starting %s without credentials - trading will be blocked by risk engine", settings.trading_mode.value)
     _state["state"] = "RUNNING"
     log.info("%s mode=%s market=%s", BOT_STARTED, settings.trading_mode.value, settings.market)
-    return JSONResponse({"ok": True, "state": "RUNNING"})
+    return JSONResponse({"ok": True, "state": "RUNNING", "mode": settings.trading_mode.value})
 
 
 @router.post("/bot/pause")
 async def bot_pause() -> JSONResponse:
+    require_not_emergency(bool(_state["emergency"]))
     if _state["state"] != "RUNNING":
         raise HTTPException(status_code=409, detail="Not running")
     _state["state"] = "PAUSED"

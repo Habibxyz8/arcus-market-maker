@@ -1,11 +1,12 @@
 import StatusCard from '../components/StatusCard'
+import TradingModeBadge from '../components/TradingModeBadge'
 
 export default function Dashboard() {
   return (
     <div className="min-h-screen p-6 max-w-7xl mx-auto space-y-6">
       <header className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold tracking-tight">Arcus Market Maker <span className="text-slate-500 font-normal">· Phase 3 scaffold</span></h1>
-        <span className="text-xs px-2 py-1 rounded bg-slate-800 border border-slate-700">PAPER default · LIVE gated</span>
+        <h1 className="text-2xl font-bold tracking-tight">Arcus Market Maker <span className="text-slate-500 font-normal">· Phase 4</span></h1>
+        <TradingModeBadge />
       </header>
 
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
