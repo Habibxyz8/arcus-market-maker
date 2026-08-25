@@ -41,14 +41,15 @@ class Settings(BaseSettings):
         default="wss://testnet-ws.arcus.xyz", alias="ARCUS_TESTNET_WS_URL"
     )
 
-    # Strategy / risk (Phases 9-16, 19) + micro TP/SL upgrade
-    market: str = Field(default="BTC-PERP", alias="MARKET")
+    # Strategy / risk + micro TP/SL + dynamic margin/leverage (Arcus pair limits)
+    market: str = Field(default="BTC-USD", alias="MARKET")
     order_size: float = Field(default=0.001, alias="ORDER_SIZE")
     order_size_usd: float = Field(default=50.0, alias="ORDER_SIZE_USD")
+    margin_usd: float = Field(default=5.0, alias="MARGIN_USD")
     max_order_size: float = Field(default=0.01, alias="MAX_ORDER_SIZE")
-    bid_spread_bps: float = Field(default=10.0, alias="BID_SPREAD_BPS")
-    ask_spread_bps: float = Field(default=10.0, alias="ASK_SPREAD_BPS")
-    quote_refresh_interval_ms: int = Field(default=500, alias="QUOTE_REFRESH_INTERVAL_MS")
+    bid_spread_bps: float = Field(default=6.0, alias="BID_SPREAD_BPS")
+    ask_spread_bps: float = Field(default=6.0, alias="ASK_SPREAD_BPS")
+    quote_refresh_interval_ms: int = Field(default=100, alias="QUOTE_REFRESH_INTERVAL_MS")
     max_inventory: float = Field(default=0.05, alias="MAX_INVENTORY")
     max_exposure: float = Field(default=5000.0, alias="MAX_EXPOSURE")
     max_daily_loss: float = Field(default=500.0, alias="MAX_DAILY_LOSS")

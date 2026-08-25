@@ -9,11 +9,15 @@ from backend.monitoring.logger import RATE_LIMIT_WARNING, get_logger
 
 log = get_logger(__name__)
 
-MAX_RPS = 8  # conservative
+MAX_RPS_PAPER = 50  # millisecond HFT in PAPER (limit orders, no rate hit)
+MAX_RPS_LIVE = 8  # conservative for LIVE/TESTNET per Arcus rate-limits.md
 
 
 class RateLimiter:
-    def __init__(self, max_rps: int = MAX_RPS) -> None:
+    def __init__(self, max_rps: int | None = None) -> None:
+        if max_rps is None:
+            from backend.config.settings import settings
+            max_rps = MAX_RPS_PAPER if settings.is_paper else MAX_RPS_LIVE
         self.max_rps = max_rps
         self._times: deque[float] = deque()
         self._lock = asyncio.Lock()

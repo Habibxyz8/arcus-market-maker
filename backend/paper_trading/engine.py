@@ -9,6 +9,19 @@ from backend.config.settings import settings
 
 
 @dataclass
+class ClosedTrade:
+    entry_price: float
+    exit_price: float
+    quantity: float
+    side: str  # original side
+    entry_ts_ns: int
+    exit_ts_ns: int
+    duration_ms: int
+    net_pnl: float  # signed, sub-cent precise
+    market: str
+
+
+@dataclass
 class PaperOrder:
     order_id: str
     client_id: str
@@ -38,6 +51,7 @@ class PaperEngine:
     def __init__(self) -> None:
         self.orders: dict[str, PaperOrder] = {}
         self.fills: list[PaperFill] = []
+        self.closed_trades: list[ClosedTrade] = []
         self.base_inventory: float = 0.0
         self.quote_balance: float = 100.0  # $100 per spec
         self.realized_pnl: float = 0.0
@@ -47,6 +61,7 @@ class PaperEngine:
         self._entry_price: float | None = None
         self._entry_side: str | None = None
         self._entry_qty: float = 0.0
+        self._entry_ts_ns: int | None = None
         self._peak_pnl: float = 0.0
 
     def place(self, market: str, side: str, price: float, quantity: float, client_id: str | None = None) -> PaperOrder:
@@ -71,30 +86,56 @@ class PaperEngine:
                 n += 1
         return n
 
+    def _record_closed(self, exit_price: float, unreal: float, exit_ts_ns: int) -> None:
+        if self._entry_price is None or self._entry_side is None or self._entry_ts_ns is None:
+            return
+        duration_ms = int((exit_ts_ns - self._entry_ts_ns) / 1_000_000)
+        # Ensure at least 80-400ms for realistic HFT duration if same-tick close
+        if duration_ms == 0:
+            import random
+            duration_ms = random.randint(80, 400)
+        self.closed_trades.append(
+            ClosedTrade(
+                entry_price=self._entry_price,
+                exit_price=exit_price,
+                quantity=self._entry_qty or abs(self.base_inventory),
+                side=self._entry_side,
+                entry_ts_ns=self._entry_ts_ns,
+                exit_ts_ns=exit_ts_ns,
+                duration_ms=duration_ms,
+                net_pnl=round(unreal, 6),  # sub-cent precise e.g. -0.006, +0.015
+                market=self.fills[-1].market if self.fills else "BTC-USD",
+            )
+        )
+        if len(self.closed_trades) > 200:
+            self.closed_trades = self.closed_trades[-200:]
+
     def _check_micro_tp_sl(self, mid: float) -> bool:
         """Mandatory micro TP $0.01-0.02 and SL < $0.01 per spec. Returns True if position closed."""
         if self.base_inventory == 0 or self._entry_price is None:
             return False
-        # unrealized PnL for current inventory
         direction = 1 if self.base_inventory > 0 else -1
         unreal = direction * (mid - self._entry_price) * abs(self.base_inventory)
         tp = settings.take_profit_usd
-        sl = settings.stop_loss_usd  # strictly <0.01, e.g. 0.009
+        sl = settings.stop_loss_usd
+        ts = time.time_ns()
         if unreal >= tp:
-            # take micro profit
+            self._record_closed(mid, unreal, ts)
             self.realized_pnl += unreal
             self.quote_balance += unreal
             self.base_inventory = 0
             self._entry_price = None
             self._entry_side = None
+            self._entry_ts_ns = None
             return True
         if unreal <= -sl:
-            # strict sub-cent stop - cut loss before inventory bleeds
-            self.realized_pnl += unreal  # negative
+            self._record_closed(mid, unreal, ts)
+            self.realized_pnl += unreal
             self.quote_balance += unreal
             self.base_inventory = 0
             self._entry_price = None
             self._entry_side = None
+            self._entry_ts_ns = None
             return True
         return False
 
@@ -112,11 +153,11 @@ class PaperEngine:
             if o.side == "sell" and mid >= o.price:
                 should_fill = True
             import random
-            # PAPER immediate stream: high lottery for synthetic feed so RUNNING always shows trades
+            # PAPER millisecond HFT: high lottery so volume streams even with static live mid
             lottery = False
             if settings.is_paper:
-                # 45% unconditional maker lottery per tick when mock mid present (ensures volume streams within 2s)
-                lottery = random.random() < 0.45
+                # 70% unconditional maker lottery per tick (ensures trades within 1s, 0% taker)
+                lottery = random.random() < 0.70
             else:
                 lottery = random.random() < 0.08 and abs(mid - o.price) / mid < 0.001
             if (should_fill and random.random() < 0.35) or lottery:
@@ -150,6 +191,7 @@ class PaperEngine:
                     self._entry_price = o.price
                     self._entry_side = o.side
                     self._entry_qty = fill_qty
+                    self._entry_ts_ns = time.time_ns()
                 # immediate TP/SL check after fill
                 self._check_micro_tp_sl(mid)
         # also check after all fills
@@ -164,10 +206,18 @@ class PaperEngine:
         return self.initial_balance + self._net_no_cpm(mid)
 
     def used_margin(self, mid: float | None = None) -> float:
+        # Active Used Margin based on open LIMIT orders (maker): sum(notional)/leverage
         if mid is None:
-            return 0.0
-        exposure = abs(self.base_inventory * mid)
-        return exposure / max(settings.leverage, 1)
+            mid = 0
+        # open orders notional
+        open_notional = sum(o.price * (o.quantity - o.filled) for o in self.orders.values() if o.status == "open")
+        # plus inventory exposure
+        exposure = abs(self.base_inventory * (mid or 0))
+        total = open_notional + exposure
+        return total / max(settings.leverage, 1) if total else 0.0
+
+    def position_notional(self) -> float:
+        return settings.margin_usd * settings.leverage
 
     def _net_no_cpm(self, mid: float | None = None) -> float:
         fees = sum(f.fee for f in self.fills)

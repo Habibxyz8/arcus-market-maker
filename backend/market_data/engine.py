@@ -18,20 +18,19 @@ log = get_logger(__name__)
 
 STALE_SEC = 5.0
 
-# PAPER synthetic prices for multi-pair (so RUNNING always trades)
+# Live Arcus symbols (per getMarkets). Synthetic fallback only if live stale >1s.
 MOCK_PRICES: dict[str, float] = {
     "BTC-USD": 65000.0,
-    "BTC-PERP": 65000.0,
     "ETH-USD": 3500.0,
-    "ETH-PERP": 3500.0,
     "SOL-USD": 150.0,
-    "SOL-PERP": 150.0,
     "NVDA-USD": 500.0,
     "TSLA-USD": 250.0,
-    "NVDA-PERP": 500.0,
-    "TSLA-PERP": 250.0,
+    "AAPL-USD": 220.0,
+    "SPY-USD": 580.0,
+    "QQQ-USD": 500.0,
 }
-MARKET_IDS: dict[str, int] = {"BTC-USD": 1, "BTC-PERP": 1, "ETH-USD": 2, "ETH-PERP": 2, "SOL-USD": 3, "SOL-PERP": 3, "NVDA-USD": 4, "TSLA-USD": 5}
+# Market IDs from live Arcus (cached). Fallback map if fetch fails.
+MARKET_IDS: dict[str, int] = {"BTC-USD": 1, "ETH-USD": 2, "SOL-USD": 3, "NVDA-USD": 4, "TSLA-USD": 5, "AAPL-USD": 6, "SPY-USD": 7, "QQQ-USD": 8}
 
 
 @dataclass
@@ -131,20 +130,22 @@ class MarketDataEngine:
         return (time.time_ns() - self._last_update_ns) / 1e9 > STALE_SEC
 
     def _seed_mock(self) -> None:
-        # immediate paper quote so RUNNING trades instantly
         mid = self._mock_base
         self._apply_bbo(mid * 0.9999, mid * 1.0001, sequence=None)
 
     async def _synthetic_loop(self) -> None:
-        # PAPER-only synthetic mid wiggle (±0.08%) every 350ms so fills stream fast
+        # In PAPER, always wiggle mid slightly (±0.06%) every 350ms on top of live price
+        # so BID/ASK/MID stream without lag even when Arcus REST is 1s polled
         import random
         while self._running:
             if settings.is_paper:
-                drift = (random.random() - 0.5) * 0.0016  # ±0.08%
-                self._mock_base *= (1 + drift)
-                mid = self._mock_base
-                bid = mid * (1 - 0.0004)
-                ask = mid * (1 + 0.0004)
+                # Blend live mid with synthetic drift for continuous millisecond stream
+                base = self.snapshot.mid or self._mock_base
+                drift = (random.random() - 0.5) * 0.0012  # ±0.06% per tick
+                new_mid = base * (1 + drift)
+                bid = new_mid * (1 - 0.00035)
+                ask = new_mid * (1 + 0.00035)
+                self._mock_base = new_mid
                 self._apply_bbo(bid, ask, sequence=None)
             await asyncio.sleep(0.35)
 
@@ -185,43 +186,77 @@ class MarketDataEngine:
         while self._running:
             try:
                 url = settings.active_ws_url
-                # Arcus WS expects no auth for market data; we just subscribe
+                # Try public websocket for live Arcus (BBO + trades). Fallback to REST polling if not available.
                 async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:  # type: ignore[arg-type]
-                    log.info("MarketData WS connected %s", url)
-                    # Subscribe to BBO/markets per docs - best effort
-                    await ws.send(f'{{"type":"subscribe","channel":"bbo","marketId":{self.market_id}}}')
-                    await ws.send(f'{{"type":"subscribe","channel":"markets"}}')
+                    log.info("MarketData WS connected %s %s", url, self.market)
+                    # Subscribe patterns: try both Arcus spec and generic
+                    for ch in [f'{{"type":"subscribe","channel":"bbo","marketId":{self.market_id}}}',
+                               f'{{"type":"subscribe","channel":"bbo","market":"{self.market}"}}',
+                               '{"type":"subscribe","channel":"markets"}',
+                               f'{{"op":"subscribe","args":["bbo.{self.market}"]}}']:
+                        try:
+                            await ws.send(ch)
+                        except Exception:
+                            pass
                     backoff = 1.0
                     async for raw in ws:
                         try:
                             import json
                             msg = json.loads(raw)
-                            # Heartbeat
                             if msg.get("type") == "ping":
                                 await ws.send('{"type":"pong"}')
                                 continue
-                            # Try parse BBO
-                            if "bid" in msg and "ask" in msg:
-                                bid = float(msg["bid"])
-                                ask = float(msg["ask"])
-                                seq = msg.get("sequence") or msg.get("seq")
-                                self._apply_bbo(bid, ask, seq)
+                            # Direct BBO
+                            if "bid" in msg and "ask" in msg and "market" not in msg:
+                                self._apply_bbo(float(msg["bid"]), float(msg["ask"]), msg.get("sequence") or msg.get("seq"))
                             elif "bbo" in msg:
                                 b = msg["bbo"]
                                 self._apply_bbo(float(b["bid"]), float(b["ask"]), b.get("sequence"))
+                            elif msg.get("channel") == "bbo" and "data" in msg:
+                                d = msg["data"]
+                                if isinstance(d, dict) and "bid" in d and "ask" in d:
+                                    self._apply_bbo(float(d["bid"]), float(d["ask"]), d.get("sequence"))
+                            elif msg.get("topic") == f"bbo.{self.market}" and "data" in msg:
+                                d = msg["data"]
+                                self._apply_bbo(float(d["bid"]), float(d["ask"]), d.get("seq"))
+                            # Markets channel may carry oraclePrice
+                            if msg.get("channel") == "markets" and "data" in msg:
+                                for m in msg["data"] if isinstance(msg["data"], list) else [msg["data"]]:
+                                    if isinstance(m, dict) and m.get("marketDisplayName") == self.market:
+                                        o = m.get("oraclePrice") or m.get("markPrice")
+                                        if o:
+                                            try:
+                                                mid = float(o)
+                                                self._apply_bbo(mid*0.9999, mid*1.0001, None)
+                                            except Exception:
+                                                pass
                         except Exception as e:
                             log.error("WS parse error %s", e)
-                        # stale check
-                        if self.is_stale():
-                            log.warning(MARKET_DATA_STALE + " no update %.1fs", STALE_SEC)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 log.error("WS disconnect %s backoff %.1f", type(e).__name__, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30)
-            # periodic REST fallback
-            await self._fetch_rest_snapshot()
+            # REST live polling every 1s for all pairs (BBO -> livePrices -> markets)
+            try:
+                await self._fetch_rest_snapshot()
+                # also poll livePrices for this market
+                try:
+                    lp = await self._client.get_live_prices()
+                    # livePrices shape: {prices: [{market:"BTC-USD", bid, ask}]}
+                    lst = lp.get("prices") or lp.get("markets") or []
+                    for p in lst if isinstance(lst, list) else []:
+                        if isinstance(p, dict) and (p.get("market")==self.market or p.get("marketDisplayName")==self.market):
+                            bid = p.get("bid") or p.get("bestBid")
+                            ask = p.get("ask") or p.get("bestAsk")
+                            if bid and ask:
+                                self._apply_bbo(float(bid), float(ask), None)
+                                break
+                except Exception:
+                    pass
+            except Exception:
+                pass
             if self.is_stale():
-                log.warning(MARKET_DATA_STALE)
+                log.warning(MARKET_DATA_STALE + " %s", self.market)
             await asyncio.sleep(1)

@@ -226,11 +226,22 @@ async def list_fills() -> JSONResponse:
 
 @router.get("/config/settings")
 async def get_settings() -> JSONResponse:
-    # Safe expose (no secrets) + presets + markets
+    # Safe expose (no secrets) + presets + markets + dynamic margin
+    try:
+        from backend.strategy.market_limits import get_max_leverage_sync, get_tick_step
+        max_lev = get_max_leverage_sync(settings.market)
+        tick, step = get_tick_step(settings.market)
+    except Exception:
+        max_lev, tick, step = 10, "0.1", "0.01"
     return JSONResponse({
         "market": settings.market,
         "order_size": settings.order_size,
         "order_size_usd": settings.order_size_usd,
+        "margin_usd": settings.margin_usd,
+        "position_notional": settings.margin_usd * settings.leverage,
+        "max_leverage_for_pair": max_lev,
+        "tickSize": tick,
+        "stepSize": step,
         "max_order_size": settings.max_order_size,
         "bid_spread_bps": settings.bid_spread_bps,
         "ask_spread_bps": settings.ask_spread_bps,
@@ -257,34 +268,64 @@ async def get_settings() -> JSONResponse:
 
 @router.post("/config/settings")
 async def update_settings(payload: dict[str, Any]) -> JSONResponse:
-    allowed = {"market","order_size","order_size_usd","max_order_size","bid_spread_bps","ask_spread_bps","quote_refresh_interval_ms","max_inventory","max_exposure","max_daily_loss","max_open_orders","max_order_age_sec","min_expected_profit","min_expected_edge_bps","inventory_skew_factor","maker_fee_bps","dead_mans_switch_timeout_sec","account_balance","leverage","take_profit_usd","stop_loss_usd","strategy_preset"}
+    # Dynamic margin/leverage with Arcus pair limits
+    from backend.strategy.market_limits import get_max_leverage_sync
+    allowed = {"market","order_size","order_size_usd","margin_usd","max_order_size","bid_spread_bps","ask_spread_bps","quote_refresh_interval_ms","max_inventory","max_exposure","max_daily_loss","max_open_orders","max_order_age_sec","min_expected_profit","min_expected_edge_bps","inventory_skew_factor","maker_fee_bps","dead_mans_switch_timeout_sec","account_balance","leverage","take_profit_usd","stop_loss_usd","strategy_preset"}
     for k, v in payload.items():
         if k in allowed and hasattr(settings, k):
-            # leverage mandatory 10x guard
-            if k == "leverage" and int(v) != 10:
+            if k == "margin_usd":
+                # Margin $1 to $100+ (allow up to account_balance, clamp 1..1000)
+                fv = float(v)
+                if not (1 <= fv <= 1000):
+                    continue
+                setattr(settings, k, fv)
+                # auto-sync notional
+                settings.order_size_usd = fv * settings.leverage
                 continue
-            # SL must be <0.01 strict
+            if k == "leverage":
+                # Dynamically enforce max leverage per Arcus pair
+                max_lev = get_max_leverage_sync(settings.market)
+                iv = int(v)
+                if iv < 1 or iv > max_lev:
+                    continue
+                setattr(settings, k, iv)
+                settings.order_size_usd = settings.margin_usd * iv
+                continue
+            # SL must be <0.01 strict sub-cent
             if k == "stop_loss_usd" and float(v) >= 0.01:
                 continue
             # TP 0.01-0.02
             if k == "take_profit_usd" and not (0.01 <= float(v) <= 0.02):
                 continue
             setattr(settings, k, v)  # type: ignore[attr-defined]
-    # preset apply overrides
+    # preset apply overrides (presets set leverage to 10 but respect max)
     if "strategy_preset" in payload:
         apply_preset(payload["strategy_preset"], settings)
+        # clamp leverage to pair max after preset
+        try:
+            max_lev = get_max_leverage_sync(settings.market)
+            if settings.leverage > max_lev:
+                settings.leverage = max_lev
+        except Exception:
+            pass
     if "market" in payload:
         bot.set_market(payload["market"])
-    # get_settings returns JSONResponse; unwrap to dict
+        # re-clamp leverage to new pair max
+        try:
+            max_lev = get_max_leverage_sync(payload["market"])
+            if settings.leverage > max_lev:
+                settings.leverage = max_lev
+        except Exception:
+            pass
     resp = await get_settings()
     import json as _json
     data = _json.loads(resp.body.decode())
     return JSONResponse({"ok": True, "settings": data})
 
-
 @router.get("/markets/list")
 async def list_markets() -> JSONResponse:
     return JSONResponse({"markets": settings.supported_markets.split(","), "current": settings.market})
+
 
 @router.post("/markets/select")
 async def select_market(payload: dict[str, Any]) -> JSONResponse:
@@ -295,7 +336,61 @@ async def select_market(payload: dict[str, Any]) -> JSONResponse:
     return JSONResponse({"ok": True, "market": m})
 
 
-# Dashboard WS - pushes status every 2s (Phase 39)
+@router.get("/markets/limits")
+async def market_limits() -> JSONResponse:
+    from backend.strategy.market_limits import fetch_limits
+    limits = await fetch_limits()
+    # ensure preset leverage respects limits (don't auto change)
+    return JSONResponse({"limits": limits, "current_market": settings.market})
+
+
+@router.get("/trades/history")
+async def trade_history() -> JSONResponse:
+    # Live closed trade log with exact sub-cent PnL
+    trades = []
+    for t in bot.paper.closed_trades[-100:]:
+        trades.append({
+            "entry_price": t.entry_price,
+            "exit_price": t.exit_price,
+            "quantity": t.quantity,
+            "side": t.side,
+            "entry_ts": t.entry_ts_ns,
+            "exit_ts": t.exit_ts_ns,
+            "duration_ms": t.duration_ms,
+            "net_pnl": t.net_pnl,  # e.g. -0.006, +0.015
+            "net_pnl_str": f"{t.net_pnl:+.3f}",  # sub-cent precise display
+            "market": t.market,
+            "is_loss": t.net_pnl < 0,
+            "is_win": t.net_pnl > 0,
+        })
+    # sort newest first
+    trades.reverse()
+    return JSONResponse({"trades": trades, "count": len(trades), "trading_mode": settings.trading_mode.value})
+
+
+@router.post("/bot/toggle")
+async def bot_toggle(payload: dict[str, Any] | None = None) -> JSONResponse:
+    # Unified toggle: if RUNNING -> STOP, else START
+    confirm = bool((payload or {}).get("confirm_live", False))
+    if bot.state == "RUNNING":
+        await bot.stop()
+        _sync_state()
+        return JSONResponse({"ok": True, "state": bot.state, "action": "stopped"})
+    else:
+        require_not_emergency(bot.emergency.active)
+        validate_live_start(confirm)
+        if settings.trading_mode.value in ("LIVE", "TESTNET") and not settings.has_credentials():
+            log.warning("Starting %s without credentials", settings.trading_mode.value)
+        try:
+            await bot.start()
+        except RuntimeError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        _sync_state()
+        log.info("%s mode=%s market=%s", BOT_STARTED, settings.trading_mode.value, settings.market)
+        return JSONResponse({"ok": True, "state": bot.state, "action": "started", "mode": settings.trading_mode.value})
+
+
+# Dashboard WS - pushes status every 300ms for live BID/ASK/MID without lag
 @router.websocket("/ws/dashboard")
 async def ws_dashboard(ws: WebSocket) -> None:
     await ws.accept()
@@ -305,6 +400,6 @@ async def ws_dashboard(ws: WebSocket) -> None:
             payload["type"] = "status"
             payload["ts"] = datetime.now(timezone.utc).isoformat()
             await ws.send_text(json.dumps(payload, default=str))
-            await asyncio.sleep(2)
+            await asyncio.sleep(0.3)
     except WebSocketDisconnect:
         pass

@@ -19,9 +19,12 @@ class Quote:
 
 
 def _round_to_tick(price: float, tick: float = 0.1) -> float:
-    # Simple tick rounding - in production use market tickSize
     import math
+    # Use market tickSize; round to nearest tick
     return round(price / tick) * tick
+
+# Pure maker: always ALO (Add Liquidity Only) => 0% taker fees
+MAKER_TIF = 3  # ALO
 
 
 def compute_quotes(

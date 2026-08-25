@@ -61,22 +61,46 @@ class BotService:
         self.state = "STOPPED"
 
     async def _quote_loop(self) -> None:
+        # Enforce pure maker: millisecond HFT, dynamic margin*leverage, micro TP/SL already in PaperEngine
         while self.state == "RUNNING":
             try:
                 await self.limiter.acquire()
                 snap = self.md.snapshot
-                # PAPER: mock ensures mid exists; if still stale/None, seed again and continue (don't cancel forever)
                 if snap.mid is None:
                     if settings.is_paper:
                         self.md._seed_mock()
                         snap = self.md.snapshot
                     else:
                         self.paper.cancel_all()
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(0.5)
                         continue
-                # Sync leverage/balance from settings to paper engine each loop
+                # Sync dynamic margin/leverage: Position Notional = Margin * Leverage
+                # Enforce Arcus max leverage per pair
+                try:
+                    from backend.strategy.market_limits import get_max_leverage_sync
+                    max_lev = get_max_leverage_sync(snap.market)
+                    if settings.leverage > max_lev:
+                        settings.leverage = max_lev
+                except Exception:
+                    pass
                 self.paper.leverage = settings.leverage
                 self.paper.initial_balance = settings.account_balance
+                # Derive notional from margin*leverage if margin set
+                if settings.margin_usd > 0:
+                    # Ensure margin $1-100+ and leverage respects pair limit
+                    margin = max(1.0, min(settings.margin_usd, settings.account_balance))
+                    # clamp leverage to pair max
+                    try:
+                        from backend.strategy.market_limits import get_max_leverage_sync as _gml
+                        margin = max(1.0, min(margin, 1000))
+                        max_lev2 = _gml(snap.market)
+                        if settings.leverage > max_lev2:
+                            settings.leverage = max_lev2
+                    except Exception:
+                        pass
+                    notional = margin * settings.leverage
+                    # keep order_size_usd in sync for UI
+                    settings.order_size_usd = notional
                 # risk
                 rc = check_all(snap, settings.order_size, "buy", self.paper.base_inventory, exposure=self.paper.base_inventory * (snap.mid or 0), daily_loss=self.daily_loss, open_orders=len(self.paper.open_orders()), rate_remaining=None, emergency=self.emergency.active)
                 if not rc.passed:
