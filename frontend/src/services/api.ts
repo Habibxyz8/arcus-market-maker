@@ -23,4 +23,6 @@ export const api = {
   marketSnapshot: () => j<any>('/api/market/snapshot'),
   getSettings: () => j<any>('/api/config/settings'),
   updateSettings: (p: any) => j<any>('/api/config/settings', { method: 'POST', body: JSON.stringify(p) }),
+  listMarkets: () => j<any>('/api/markets/list'),
+  selectMarket: (market: string) => j<any>('/api/markets/select', { method: 'POST', body: JSON.stringify({ market }) }),
 }

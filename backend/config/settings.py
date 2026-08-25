@@ -41,24 +41,34 @@ class Settings(BaseSettings):
         default="wss://testnet-ws.arcus.xyz", alias="ARCUS_TESTNET_WS_URL"
     )
 
-    # Strategy / risk (Phases 9-16, 19)
+    # Strategy / risk (Phases 9-16, 19) + micro TP/SL upgrade
     market: str = Field(default="BTC-PERP", alias="MARKET")
     order_size: float = Field(default=0.001, alias="ORDER_SIZE")
+    order_size_usd: float = Field(default=50.0, alias="ORDER_SIZE_USD")
     max_order_size: float = Field(default=0.01, alias="MAX_ORDER_SIZE")
     bid_spread_bps: float = Field(default=10.0, alias="BID_SPREAD_BPS")
     ask_spread_bps: float = Field(default=10.0, alias="ASK_SPREAD_BPS")
-    quote_refresh_interval_ms: int = Field(default=1000, alias="QUOTE_REFRESH_INTERVAL_MS")
+    quote_refresh_interval_ms: int = Field(default=500, alias="QUOTE_REFRESH_INTERVAL_MS")
     max_inventory: float = Field(default=0.05, alias="MAX_INVENTORY")
     max_exposure: float = Field(default=5000.0, alias="MAX_EXPOSURE")
     max_daily_loss: float = Field(default=500.0, alias="MAX_DAILY_LOSS")
     max_open_orders: int = Field(default=2, alias="MAX_OPEN_ORDERS")
     max_order_age_sec: int = Field(default=30, alias="MAX_ORDER_AGE_SEC")
-    min_expected_profit: float = Field(default=0.1, alias="MIN_EXPECTED_PROFIT")
-    min_expected_edge_bps: float = Field(default=2.0, alias="MIN_EXPECTED_EDGE_BPS")
+    min_expected_profit: float = Field(default=0.01, alias="MIN_EXPECTED_PROFIT")
+    min_expected_edge_bps: float = Field(default=1.0, alias="MIN_EXPECTED_EDGE_BPS")
     inventory_skew_factor: float = Field(default=0.5, alias="INVENTORY_SKEW_FACTOR")
     maker_fee_bps: float = Field(default=0.0, alias="MAKER_FEE_BPS")
     dead_mans_switch_timeout_sec: int = Field(
         default=30, alias="DEAD_MANS_SWITCH_TIMEOUT_SEC"
+    )
+    # Upgrade: $100 balance, 10x leverage, micro TP/SL, presets
+    account_balance: float = Field(default=100.0, alias="ACCOUNT_BALANCE")
+    leverage: int = Field(default=10, alias="LEVERAGE")
+    take_profit_usd: float = Field(default=0.015, alias="TAKE_PROFIT_USD")
+    stop_loss_usd: float = Field(default=0.009, alias="STOP_LOSS_USD")
+    strategy_preset: str = Field(default="guru", alias="STRATEGY_PRESET")
+    supported_markets: str = Field(
+        default="BTC-USD,ETH-USD,SOL-USD,NVDA-USD,TSLA-USD", alias="SUPPORTED_MARKETS"
     )
 
     # Backend

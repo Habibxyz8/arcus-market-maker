@@ -14,6 +14,7 @@ from backend.models.schemas import BotStatusResponse, HealthResponse, MarketSnap
 from backend.monitoring.logger import BOT_STARTED, BOT_STOPPED, EMERGENCY_STOP, get_logger
 from backend.services.trading_mode import describe_mode, require_not_emergency, validate_live_start
 from backend.services.bot import BotService
+from backend.strategy.presets import PRESETS, apply_preset
 
 log = get_logger(__name__)
 router = APIRouter()
@@ -154,11 +155,17 @@ async def analytics_pnl() -> JSONResponse:
         "realized": s["realized_pnl"],
         "unrealized": s["unrealized_pnl"],
         "inventory_pnl": s["unrealized_pnl"],
+        "equity": s["equity"],
+        "used_margin": s["used_margin"],
+        "account_balance": s["account_balance"],
+        "cpm": s["cpm"],
         "volume": s["volume"],
         "per_1k": (s["net_pnl"] / s["volume"] * 1000) if s["volume"] else 0,
         "per_10k": (s["net_pnl"] / s["volume"] * 10000) if s["volume"] else 0,
         "per_100k": (s["net_pnl"] / s["volume"] * 100000) if s["volume"] else 0,
-        "per_1m": (s["net_pnl"] / s["volume"] * 1000000) if s["volume"] else 0,
+        "per_1m": s["cpm"],
+        "take_profit_usd": s["take_profit_usd"],
+        "stop_loss_usd": s["stop_loss_usd"],
     })
 
 
@@ -219,10 +226,11 @@ async def list_fills() -> JSONResponse:
 
 @router.get("/config/settings")
 async def get_settings() -> JSONResponse:
-    # Safe expose (no secrets)
+    # Safe expose (no secrets) + presets + markets
     return JSONResponse({
         "market": settings.market,
         "order_size": settings.order_size,
+        "order_size_usd": settings.order_size_usd,
         "max_order_size": settings.max_order_size,
         "bid_spread_bps": settings.bid_spread_bps,
         "ask_spread_bps": settings.ask_spread_bps,
@@ -237,17 +245,54 @@ async def get_settings() -> JSONResponse:
         "inventory_skew_factor": settings.inventory_skew_factor,
         "maker_fee_bps": settings.maker_fee_bps,
         "dead_mans_switch_timeout_sec": settings.dead_mans_switch_timeout_sec,
+        "account_balance": settings.account_balance,
+        "leverage": settings.leverage,
+        "take_profit_usd": settings.take_profit_usd,
+        "stop_loss_usd": settings.stop_loss_usd,
+        "strategy_preset": settings.strategy_preset,
+        "supported_markets": settings.supported_markets.split(","),
+        "presets": PRESETS,
     })
 
 
 @router.post("/config/settings")
 async def update_settings(payload: dict[str, Any]) -> JSONResponse:
-    # Allow updating mutable fields (no secrets, no TRADING_MODE via this endpoint)
-    allowed = {"market","order_size","max_order_size","bid_spread_bps","ask_spread_bps","quote_refresh_interval_ms","max_inventory","max_exposure","max_daily_loss","max_open_orders","max_order_age_sec","min_expected_profit","min_expected_edge_bps","inventory_skew_factor","maker_fee_bps","dead_mans_switch_timeout_sec"}
+    allowed = {"market","order_size","order_size_usd","max_order_size","bid_spread_bps","ask_spread_bps","quote_refresh_interval_ms","max_inventory","max_exposure","max_daily_loss","max_open_orders","max_order_age_sec","min_expected_profit","min_expected_edge_bps","inventory_skew_factor","maker_fee_bps","dead_mans_switch_timeout_sec","account_balance","leverage","take_profit_usd","stop_loss_usd","strategy_preset"}
     for k, v in payload.items():
         if k in allowed and hasattr(settings, k):
+            # leverage mandatory 10x guard
+            if k == "leverage" and int(v) != 10:
+                continue
+            # SL must be <0.01 strict
+            if k == "stop_loss_usd" and float(v) >= 0.01:
+                continue
+            # TP 0.01-0.02
+            if k == "take_profit_usd" and not (0.01 <= float(v) <= 0.02):
+                continue
             setattr(settings, k, v)  # type: ignore[attr-defined]
-    return JSONResponse({"ok": True, "settings": await get_settings()})  # type: ignore
+    # preset apply overrides
+    if "strategy_preset" in payload:
+        apply_preset(payload["strategy_preset"], settings)
+    if "market" in payload:
+        bot.set_market(payload["market"])
+    # get_settings returns JSONResponse; unwrap to dict
+    resp = await get_settings()
+    import json as _json
+    data = _json.loads(resp.body.decode())
+    return JSONResponse({"ok": True, "settings": data})
+
+
+@router.get("/markets/list")
+async def list_markets() -> JSONResponse:
+    return JSONResponse({"markets": settings.supported_markets.split(","), "current": settings.market})
+
+@router.post("/markets/select")
+async def select_market(payload: dict[str, Any]) -> JSONResponse:
+    m = payload.get("market")
+    if m not in settings.supported_markets.split(","):
+        raise HTTPException(status_code=400, detail="Unsupported market")
+    bot.set_market(m)
+    return JSONResponse({"ok": True, "market": m})
 
 
 # Dashboard WS - pushes status every 2s (Phase 39)

@@ -32,7 +32,10 @@ def compute_quotes(
 ) -> Quote | None:
     fv_res = fair_value(snap)
     fv = fv_res.fair_value
-    if fv is None or snap.stale:
+    # PAPER with synthetic mock: allow even if stale flag was just set (engine seeds mock)
+    if fv is None:
+        return None
+    if snap.stale and not settings.is_paper:
         return None
     # Phase 10: dynamic spread
     base_bps = (settings.bid_spread_bps + settings.ask_spread_bps) / 2
@@ -52,9 +55,12 @@ def compute_quotes(
     ask = _round_to_tick(fv * (1 + ask_bps / 10000), tick_size)
     if bid is None or ask is None or bid >= ask:
         return None
-    # Phase 12: adaptive size
-    base_size = settings.order_size
-    # Reduce size when vol high or depth low
+    # Phase 12: adaptive size - USD-based with 10x leverage
+    # User custom USD size; convert to qty via fv; presets adjust spread/refresh
+    usd_size = settings.order_size_usd
+    # clamp $1..$100 (balance) * leverage headroom
+    usd_size = max(1.0, min(usd_size, settings.account_balance * settings.leverage * 0.7))
+    base_size = usd_size / max(fv, 1.0) if fv else settings.order_size
     size = base_size
     if recent_vol and recent_vol > 0.03:
         size *= 0.5

@@ -65,11 +65,18 @@ class BotService:
             try:
                 await self.limiter.acquire()
                 snap = self.md.snapshot
-                if snap.stale or snap.mid is None:
-                    # Phase 7: stale -> cancel quotes
-                    self.paper.cancel_all()
-                    await asyncio.sleep(1)
-                    continue
+                # PAPER: mock ensures mid exists; if still stale/None, seed again and continue (don't cancel forever)
+                if snap.mid is None:
+                    if settings.is_paper:
+                        self.md._seed_mock()
+                        snap = self.md.snapshot
+                    else:
+                        self.paper.cancel_all()
+                        await asyncio.sleep(1)
+                        continue
+                # Sync leverage/balance from settings to paper engine each loop
+                self.paper.leverage = settings.leverage
+                self.paper.initial_balance = settings.account_balance
                 # risk
                 rc = check_all(snap, settings.order_size, "buy", self.paper.base_inventory, exposure=self.paper.base_inventory * (snap.mid or 0), daily_loss=self.daily_loss, open_orders=len(self.paper.open_orders()), rate_remaining=None, emergency=self.emergency.active)
                 if not rc.passed:
@@ -106,6 +113,10 @@ class BotService:
                 log.error("quote loop error %s", type(e).__name__)
                 await asyncio.sleep(1)
 
+    def set_market(self, market: str) -> None:
+        self.md.set_market(market)
+        settings.market = market
+
     def status_dict(self) -> dict[str, Any]:
         snap = self.md.snapshot
         pnl = self.paper.pnl(snap.mid)
@@ -119,7 +130,7 @@ class BotService:
             "mid": snap.mid,
             "spread": snap.spread,
             "spread_bps": snap.spread_bps,
-            "stale": snap.stale,
+            "stale": snap.stale if not settings.is_paper else False,  # PAPER never stale to UI
             "inventory": self.paper.base_inventory,
             "exposure": self.paper.base_inventory * (snap.mid or 0),
             "open_orders": len(self.paper.open_orders()),
@@ -128,5 +139,14 @@ class BotService:
             "unrealized_pnl": pnl["unrealized"],
             "fees": pnl["fees"],
             "net_pnl": pnl["net"],
+            "equity": pnl["equity"],
+            "used_margin": pnl["used_margin"],
+            "cpm": pnl["cpm"],
+            "account_balance": settings.account_balance,
+            "leverage": settings.leverage,
+            "order_size_usd": settings.order_size_usd,
+            "take_profit_usd": settings.take_profit_usd,
+            "stop_loss_usd": settings.stop_loss_usd,
+            "preset": settings.strategy_preset,
             "rate_usage_pct": self.limiter.usage_pct(),
         }
