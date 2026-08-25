@@ -1,0 +1,17 @@
+# Phase 3 - Backend stack (async, typed, modular)
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+pydantic==2.11.7
+pydantic-settings==2.9.1
+sqlalchemy[asyncio]==2.0.41
+aiosqlite==0.21.0
+httpx==0.27.2
+websockets==15.0.1
+python-dotenv==1.1.1
+python-multipart==0.0.20
+orjson==3.11.3
+# tests
+pytest==8.4.1
+pytest-asyncio==1.1.0
+httpx==0.27.2
+anyio==4.9.0

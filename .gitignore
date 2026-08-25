@@ -45,3 +45,8 @@ logs/
 
 # OS
 .cache/
+# Frontend vite build
+frontend/dist/
+frontend/vite.config.d.ts
+frontend/vite.config.js
+*.tsbuildinfo
