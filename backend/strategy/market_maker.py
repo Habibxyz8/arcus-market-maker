@@ -52,18 +52,28 @@ def compute_quotes(
     # skew: long inventory -> ask more attractive (lower), bid less aggressive
     bid_bps = base_bps + skew * 10  # bps added to bid distance
     ask_bps = base_bps - skew * 10
-    bid_bps = max(1, bid_bps)
-    ask_bps = max(1, ask_bps)
-    bid = _round_to_tick(fv * (1 - bid_bps / 10000), tick_size)
-    ask = _round_to_tick(fv * (1 + ask_bps / 10000), tick_size)
+    bid_bps = max(0.8, bid_bps)
+    ask_bps = max(0.8, ask_bps)
+    # Continuous quoting at latest Bid/Ask touch: use live snap bid/ask when available for true market making
+    if snap.bid is not None and snap.ask is not None and snap.bid > 0 and snap.ask > 0:
+        # Place at touch: bid at best bid, ask at best ask (with micro skew)
+        bid = _round_to_tick(snap.bid * (1 - (bid_bps - 1.0) / 10000), tick_size) if bid_bps > 1 else snap.bid
+        ask = _round_to_tick(snap.ask * (1 + (ask_bps - 1.0) / 10000), tick_size) if ask_bps > 1 else snap.ask
+        # Ensure still inside spread: nudge if crossed
+        if bid >= ask:
+            bid = _round_to_tick(fv * (1 - bid_bps / 10000), tick_size)
+            ask = _round_to_tick(fv * (1 + ask_bps / 10000), tick_size)
+    else:
+        bid = _round_to_tick(fv * (1 - bid_bps / 10000), tick_size)
+        ask = _round_to_tick(fv * (1 + ask_bps / 10000), tick_size)
     if bid is None or ask is None or bid >= ask:
         return None
-    # Phase 12: adaptive size - USD-based with 10x leverage
-    # User custom USD size; convert to qty via fv; presets adjust spread/refresh
+    # Phase 12: adaptive size - USD-based, total position = margin*leverage, split across 2 sides
     usd_size = settings.order_size_usd
-    # clamp $1..$100 (balance) * leverage headroom
-    usd_size = max(1.0, min(usd_size, settings.account_balance * settings.leverage * 0.7))
-    base_size = usd_size / max(fv, 1.0) if fv else settings.order_size
+    # For 2-sided quoting, each side gets half the notional so total used = margin
+    usd_size_per_side = usd_size / 2.0
+    usd_size_per_side = max(1.0, min(usd_size_per_side, settings.account_balance * settings.leverage * 0.35))
+    base_size = usd_size_per_side / max(fv, 1.0) if fv else settings.order_size
     size = base_size
     if recent_vol and recent_vol > 0.03:
         size *= 0.5

@@ -213,30 +213,22 @@ class MarketDataEngine:
                     markets_to_update = list(self._snapshots.keys())
                     for m in markets_to_update:
                         snap = self._snapshots[m]
-                        # Use live mid if recently updated via REST/WS, else mock
                         base = snap.mid or self._mock_bases.get(m, MOCK_PRICES.get(m, 100))
-                        # If base is far from live (e.g., SOL 150 vs live 95), nudge toward live slowly
-                        try:
-                            from backend.strategy.market_limits import _cache as _c
-                            # live price not stored, but we have MOCK vs live: use REST to correct occasionally
-                            pass
-                        except Exception:
-                            pass
-                        drift = (random.random() - 0.5) * 0.0008  # ±0.04% smaller for multi-pair stability
+                        drift = (random.random() - 0.5) * 0.0060  # ±0.10% for natural volatility
                         new_mid = base * (1 + drift)
-                        bid = new_mid * (1 - 0.00030)
-                        ask = new_mid * (1 + 0.00030)
+                        bid = new_mid * (1 - 0.00005)
+                        ask = new_mid * (1 + 0.00005)
                         self._mock_bases[m] = new_mid
                         self._apply_bbo_for(m, bid, ask, None)
                 else:
                     base = self.snapshot.mid or self._mock_base
-                    drift = (random.random() - 0.5) * 0.0012
+                    drift = (random.random() - 0.5) * 0.0060
                     new_mid = base * (1 + drift)
-                    bid = new_mid * (1 - 0.00035)
-                    ask = new_mid * (1 + 0.00035)
+                    bid = new_mid * (1 - 0.00005)
+                    ask = new_mid * (1 + 0.00005)
                     self._mock_base = new_mid
                     self._apply_bbo(bid, ask, sequence=None)
-            await asyncio.sleep(0.35)
+            await asyncio.sleep(0.32)
 
     async def start(self) -> None:
         self._running = True

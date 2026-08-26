@@ -155,14 +155,22 @@ class BotService:
                     q = compute_quotes(snap, base_inventory=self.paper.base_inventory)
                     if not q:
                         if snap.mid and self.paper.base_inventory != 0:
-                            self.paper.simulate_market_tick(snap.mid, snap.spread or 1, market)
-                        await asyncio.sleep(0.02)
+                            self.paper.simulate_market_tick(snap.mid, snap.spread or 1, market, snap.bid, snap.ask)
+                        await asyncio.sleep(0.12)
                         continue
                     if q.bid_price and q.ask_price:
                         inp = ProfitabilityInput(fair_value=q.fair_value or snap.mid or 0, bid_price=q.bid_price, ask_price=q.ask_price, bid_size=q.bid_size, ask_size=q.ask_size, spread_bps=q.spread_bps)
                         if settings.trading_mode.value != "PAPER" and check(inp, self.paper.base_inventory) != "PROFITABLE":
                             await asyncio.sleep(0.05)
                             continue
+                    # Enforce $100 margin limit: check total used would not exceed margin_usd
+                    est_notional_bid = q.bid_price * q.bid_size if q.bid_price and q.bid_size else 0
+                    est_notional_ask = q.ask_price * q.ask_size if q.ask_price and q.ask_size else 0
+                    est_used = self.paper.used_margin(snap.mid) + (est_notional_bid + est_notional_ask) / max(settings.leverage, 1)
+                    if est_used > settings.margin_usd + 1e-6:
+                        self._set_status(f"MARGIN LIMIT ${settings.margin_usd:.0f} hit ({est_used:.2f}>{settings.margin_usd:.0f})")
+                        await asyncio.sleep(0.5)
+                        continue
                     self._set_status(f"PLACING ORDER {market} BID {q.bid_price:.2f} ASK {q.ask_price:.2f}" if q.bid_price and q.ask_price else f"PLACING {market}")
                     for o in list(self.paper.orders.values()):
                         if o.market == market and o.status == "open":
@@ -173,19 +181,20 @@ class BotService:
                         self.paper.place(market, "sell", q.ask_price, q.ask_size)
                     if snap.mid:
                         before_closed = len(self.paper.closed_trades)
-                        fills = self.paper.simulate_market_tick(snap.mid, snap.spread or 1, market)
+                        fills = self.paper.simulate_market_tick(snap.mid, snap.spread or 1, market, snap.bid, snap.ask)
                         if fills:
                             self._set_status(f"ORDER FILLED {market} {fills[0].side.upper()} {fills[0].quantity:.6f}")
                         after_closed = len(self.paper.closed_trades)
                         if after_closed > before_closed:
                             self._set_status(f"RE-OPENING CYCLE {market} PnL {self.paper.closed_trades[-1].net_pnl:+.3f}")
                             last_closed_len = after_closed
-                            await asyncio.sleep(0.015)
+                            await asyncio.sleep(0.12)
                             continue
                     if len(self.paper.closed_trades) > last_closed_len:
                         last_closed_len = len(self.paper.closed_trades)
-                        await asyncio.sleep(0.015)
+                        await asyncio.sleep(0.12)
                         continue
+                # Speed limit: natural volatility pacing, not millisecond spam
                 await asyncio.sleep(settings.quote_refresh_interval_ms / 1000)
             except asyncio.CancelledError:
                 break

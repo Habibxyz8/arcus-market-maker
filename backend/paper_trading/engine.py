@@ -180,7 +180,6 @@ class PaperEngine:
             self._entry_qty = last["entry_qty"]
 
     def _check_micro_tp_sl(self, mid: float, market: str | None = None) -> bool:
-        # Use per-market if ALL_PAIRS and market provided, else legacy single
         if market and market in self._per_market:
             pos = self._per_market[market]
             inv = pos["inventory"]
@@ -191,14 +190,33 @@ class PaperEngine:
             tp = settings.take_profit_usd
             sl = settings.stop_loss_usd
             ts = time.time_ns()
-            if unreal >= tp or unreal <= -sl or (ts - pos["entry_ts"]) // 1_000_000 > 2500:
-                self._record_closed(mid, unreal, ts, market)
+            if unreal >= tp:
+                capped = min(unreal, tp)
+                capped = max(capped, 0.01)
+                capped = min(capped, 0.02)
+                self._record_closed(mid, capped, ts, market)
+                self.realized_pnl += capped
+                self.quote_balance += capped
+                self._clear_pm(market)
+                return True
+            elif unreal <= -sl:
+                capped = -sl
+                self._record_closed(mid, capped, ts, market)
+                unreal = capped
                 self.realized_pnl += unreal
-                self.quote_balance += unreal
+                self.quote_balance += capped
+                self._clear_pm(market)
+                return True
+            elif (ts - pos["entry_ts"]) // 1_000_000 > 2500:
+                capped = max(unreal, -sl)
+                capped = min(capped, sl*2)
+                self._record_closed(mid, capped, ts, market)
+                unreal = capped
+                self.realized_pnl += unreal
+                self.quote_balance += capped
                 self._clear_pm(market)
                 return True
             return False
-        # Legacy single-market path
         if self.base_inventory == 0 or self._entry_price is None or self._entry_ts_ns is None:
             return False
         if market and self._entry_market and market != self._entry_market:
@@ -209,8 +227,25 @@ class PaperEngine:
         sl = settings.stop_loss_usd
         ts = time.time_ns()
         if unreal >= tp:
-            self._record_closed(mid, unreal, ts, market or self._entry_market)
-            self.realized_pnl += unreal
+            capped = min(unreal, tp)
+            capped = max(capped, 0.01)
+            capped = min(capped, 0.02)
+            self._record_closed(mid, capped, ts, market or self._entry_market)
+            self.realized_pnl += capped
+            self.quote_balance += capped
+            self.base_inventory = 0
+            self._entry_price = None
+            self._entry_side = None
+            self._entry_ts_ns = None
+            self._entry_market = None
+            self._entry_qty = 0
+            if market:
+                self._clear_pm(market)
+            return True
+        if unreal <= -sl:
+            capped = -sl
+            self._record_closed(mid, capped, ts, market or self._entry_market)
+            unreal = capped
             self.quote_balance += unreal
             self.base_inventory = 0
             self._entry_price = None
@@ -222,7 +257,9 @@ class PaperEngine:
                 self._clear_pm(market)
             return True
         if unreal <= -sl:
-            self._record_closed(mid, unreal, ts, market or self._entry_market)
+            capped = -sl
+            self._record_closed(mid, capped, ts, market or self._entry_market)
+            unreal = capped
             self.realized_pnl += unreal
             self.quote_balance += unreal
             self.base_inventory = 0
@@ -236,7 +273,10 @@ class PaperEngine:
             return True
         held_ms = (ts - self._entry_ts_ns) // 1_000_000
         if held_ms > 2500:
-            self._record_closed(mid, unreal, ts, market or self._entry_market)
+            capped = max(unreal, -sl)
+            capped = min(capped, sl*2)
+            self._record_closed(mid, capped, ts, market or self._entry_market)
+            unreal = capped
             self.realized_pnl += unreal
             self.quote_balance += unreal
             self.base_inventory = 0
@@ -282,7 +322,8 @@ class PaperEngine:
             self._clear_pm(market)
         return True
 
-    def simulate_market_tick(self, mid: float, spread: float = 1.0, market: str | None = None) -> list[PaperFill]:
+    def simulate_market_tick(self, mid: float, spread: float = 1.0, market: str | None = None, bid: float | None = None, ask: float | None = None) -> list[PaperFill]:
+        # Realistic matching: check TP/SL every tick, but fills only on price touch
         self._check_micro_tp_sl(mid, market)
         new_fills: list[PaperFill] = []
         for o in list(self.orders.values()):
@@ -291,13 +332,22 @@ class PaperEngine:
             if market and o.market != market:
                 continue
             should_fill = False
-            if o.side == "buy" and mid <= o.price:
-                should_fill = True
-            if o.side == "sell" and mid >= o.price:
-                should_fill = True
+            # Tight spread: allow 1 tick tolerance for realistic touch
+            tol = max(0.5, o.price * 0.00005)  # 0.5 points or 0.005% tolerance
+            if o.side == "buy":
+                if mid <= o.price + tol or (ask is not None and ask <= o.price + tol):
+                    should_fill = True
+            else:
+                if mid >= o.price - tol or (bid is not None and bid >= o.price - tol):
+                    should_fill = True
+            age_ms = (time.time_ns() - o.created_ns) // 1_000_000
+            if should_fill and age_ms < 25:
+                import random
+                if random.random() > 0.85:
+                    should_fill = False
             import random
-            lottery = random.random() < 0.70 if settings.is_paper else (random.random() < 0.08 and abs(mid - o.price) / mid < 0.001)
-            if (should_fill and random.random() < 0.35) or lottery:
+            fill_prob = 0.78
+            if should_fill and random.random() < fill_prob:
                 fill_qty = min(o.quantity - o.filled, o.quantity * 0.5 + random.random() * 0.5 * (o.quantity - o.filled))
                 fill_qty = round(fill_qty, 6)
                 if fill_qty <= 0:
