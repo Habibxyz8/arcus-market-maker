@@ -38,6 +38,17 @@ async def fetch_limits(force: bool = False) -> dict[str, dict[str, Any]]:
             sym = m.get("marketDisplayName") or m.get("market") or ""
             if not sym:
                 continue
+            if m.get("type") and m.get("type") != "PERPETUAL":
+                continue
+            if m.get("status") == "OFFLINE":
+                continue
+            # Skip illiquid / zero price markets
+            try:
+                px = float(m.get("oraclePrice") or m.get("markPrice") or 0)
+                if px < 0.01:
+                    continue
+            except Exception:
+                continue
             imf = m.get("initialMarginFraction") or "0.1"
             try:
                 lev = int(round(1 / float(imf))) if float(imf) > 0 else 10
@@ -49,11 +60,18 @@ async def fetch_limits(force: bool = False) -> dict[str, dict[str, Any]]:
                 "tickSize": m.get("tickSize", "0.1"),
                 "stepSize": m.get("stepSize", "0.01"),
                 "initialMarginFraction": imf,
+                "category": m.get("category", "CRYPTO"),
             }
         if new:
             _cache = new
             _cache_ts = time.time()
             log.info("Fetched %d market limits", len(new))
+            # Update settings supported markets dynamically
+            try:
+                from backend.config.settings import settings
+                settings.supported_markets = ",".join(sorted(new.keys()))
+            except Exception:
+                pass
         else:
             _cache = DEFAULTS.copy()
     except Exception as e:
@@ -63,6 +81,10 @@ async def fetch_limits(force: bool = False) -> dict[str, dict[str, Any]]:
     finally:
         await client.close()
     return _cache
+
+async def get_all_perp_pairs() -> list[str]:
+    lim = await fetch_limits()
+    return sorted(lim.keys())
 
 
 def get_max_leverage_sync(market: str) -> int:

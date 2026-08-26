@@ -330,8 +330,19 @@ async def list_markets() -> JSONResponse:
 @router.post("/markets/select")
 async def select_market(payload: dict[str, Any]) -> JSONResponse:
     m = payload.get("market")
-    if m not in settings.supported_markets.split(","):
-        raise HTTPException(status_code=400, detail="Unsupported market")
+    if m == "ALL_PAIRS":
+        bot.set_market(m)
+        return JSONResponse({"ok": True, "market": m})
+    # allow any live pair from limits, not just hardcoded supported
+    try:
+        from backend.strategy.market_limits import fetch_limits
+        # use cached if available
+        from backend.strategy.market_limits import _cache
+        allowed = list(_cache.keys()) if _cache else settings.supported_markets.split(",")
+    except Exception:
+        allowed = settings.supported_markets.split(",")
+    if m not in allowed and m not in settings.supported_markets.split(","):
+        raise HTTPException(status_code=400, detail=f"Unsupported market {m}. Valid: {', '.join(allowed[:10])}...")
     bot.set_market(m)
     return JSONResponse({"ok": True, "market": m})
 

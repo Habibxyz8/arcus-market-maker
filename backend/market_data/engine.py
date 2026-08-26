@@ -18,16 +18,17 @@ log = get_logger(__name__)
 
 STALE_SEC = 5.0
 
-# Live Arcus symbols (per getMarkets). Synthetic fallback only if live stale >1s.
 MOCK_PRICES: dict[str, float] = {
-    "BTC-USD": 65000.0,
-    "ETH-USD": 3500.0,
-    "SOL-USD": 150.0,
-    "NVDA-USD": 500.0,
-    "TSLA-USD": 250.0,
-    "AAPL-USD": 220.0,
-    "SPY-USD": 580.0,
-    "QQQ-USD": 500.0,
+    "BTC-USD": 77986.0,
+    "ETH-USD": 2446.0,
+    "SOL-USD": 95.9,
+    "NVDA-USD": 211.0,
+    "TSLA-USD": 343.0,
+    "AAPL-USD": 312.0,
+    "SPY-USD": 765.0,
+    "QQQ-USD": 710.0,
+    "ZEC-USD": 771.0,
+    "HYPE-USD": 80.9,
 }
 # Market IDs from live Arcus (cached). Fallback map if fetch fails.
 MARKET_IDS: dict[str, int] = {"BTC-USD": 1, "ETH-USD": 2, "SOL-USD": 3, "NVDA-USD": 4, "TSLA-USD": 5, "AAPL-USD": 6, "SPY-USD": 7, "QQQ-USD": 8}
@@ -59,7 +60,11 @@ class MarketSnapshot:
 
 class MarketDataEngine:
     def __init__(self, market: str | None = None, market_id: int | None = None) -> None:
-        self.market = market or settings.market
+        # Handle ALL_PAIRS sentinel
+        raw_market = market or settings.market
+        if raw_market == "ALL_PAIRS":
+            raw_market = "BTC-USD"
+        self.market = raw_market
         self.market_id = market_id or MARKET_IDS.get(self.market, 1)
         self.snapshot = MarketSnapshot(market=self.market, market_id=self.market_id)
         self._client = ArcusClient()
@@ -70,20 +75,40 @@ class MarketDataEngine:
         self._seq: int | None = None
         self._callbacks: list[Any] = []
         self._mock_base = MOCK_PRICES.get(self.market, 65000.0)
+        # Multi-pair snapshots for ALL_PAIRS mode
+        self._snapshots: dict[str, MarketSnapshot] = {self.market: self.snapshot}
+        self._mock_bases: dict[str, float] = {k: v for k, v in MOCK_PRICES.items()}
 
     def on_update(self, cb):  # type: ignore[no-untyped-def]
         self._callbacks.append(cb)
 
     async def _fetch_rest_snapshot(self) -> None:
         try:
-            # Prefer BBO, fallback to markets oraclePrice
+            if settings.market == "ALL_PAIRS":
+                # Fetch all markets and update per-pair snapshots
+                try:
+                    mkts = await self._client.get_markets()
+                    for m in mkts.get("markets", []) if isinstance(mkts, dict) else []:
+                        sym = m.get("marketDisplayName")
+                        if not sym or sym not in self._snapshots:
+                            continue
+                        oracle = float(m.get("oraclePrice") or m.get("markPrice") or 0) or None
+                        if oracle and oracle > 0.01:
+                            # Update mock base to live price (slow nudge)
+                            self._mock_bases[sym] = oracle
+                            self._apply_bbo_for(sym, oracle*0.9999, oracle*1.0001, None)
+                    return
+                except Exception:
+                    pass
+            # Single market path
             try:
                 bbo = await self._client.get_bbo(self.market_id)
-                # bbo shape varies; try to parse bid/ask
                 bid = float(bbo.get("bid") or bbo.get("bestBid") or 0) or None
                 ask = float(bbo.get("ask") or bbo.get("bestAsk") or 0) or None
                 if bid and ask:
                     self._apply_bbo(bid, ask, sequence=None)
+                    # sync mock base to live
+                    self._mock_bases[self.market] = (bid+ask)/2
                     return
             except Exception:
                 pass
@@ -92,7 +117,7 @@ class MarketDataEngine:
             if m:
                 oracle = float(m.get("oraclePrice") or m.get("markPrice") or 0) or None
                 if oracle:
-                    # synth spread 2 bps around oracle when no BBO
+                    self._mock_bases[self.market] = oracle
                     self._apply_bbo(oracle * 0.9999, oracle * 1.0001, sequence=None)
         except Exception as e:
             log.error("REST fallback failed %s", type(e).__name__)
@@ -133,20 +158,84 @@ class MarketDataEngine:
         mid = self._mock_base
         self._apply_bbo(mid * 0.9999, mid * 1.0001, sequence=None)
 
+    def get_snapshot_for(self, market: str) -> MarketSnapshot:
+        if market in self._snapshots:
+            return self._snapshots[market]
+        # create synthetic snapshot for this market
+        base = self._mock_bases.get(market, MOCK_PRICES.get(market, 100.0))
+        snap = MarketSnapshot(market=market, market_id=MARKET_IDS.get(market, 1))
+        mid = base
+        snap.bid = mid * 0.99965
+        snap.ask = mid * 1.00035
+        snap.mid = mid
+        snap.spread = snap.ask - snap.bid
+        snap.spread_bps = snap.spread / mid * 10000 if mid else None
+        snap.timestamp = datetime.now(timezone.utc)
+        snap.stale = False
+        snap.server_ts = int(time.time() * 1000)
+        self._snapshots[market] = snap
+        return snap
+
+    def _apply_bbo_for(self, market: str, bid: float, ask: float, sequence: int | None) -> None:
+        snap = self.get_snapshot_for(market)
+        mid = (bid + ask) / 2
+        spread = ask - bid
+        snap.bid = bid
+        snap.ask = ask
+        snap.mid = mid
+        snap.spread = spread
+        snap.spread_bps = spread / mid * 10000 if mid else None
+        snap.timestamp = datetime.now(timezone.utc)
+        snap.sequence = sequence
+        snap.stale = False
+        snap.server_ts = int(time.time() * 1000)
+        self._snapshots[market] = snap
+        # also update primary snapshot if this is current market
+        if market == self.market:
+            self.snapshot = snap
+            self._last_update_ns = time.time_ns()
+
     async def _synthetic_loop(self) -> None:
-        # In PAPER, always wiggle mid slightly (±0.06%) every 350ms on top of live price
-        # so BID/ASK/MID stream without lag even when Arcus REST is 1s polled
         import random
         while self._running:
             if settings.is_paper:
-                # Blend live mid with synthetic drift for continuous millisecond stream
-                base = self.snapshot.mid or self._mock_base
-                drift = (random.random() - 0.5) * 0.0012  # ±0.06% per tick
-                new_mid = base * (1 + drift)
-                bid = new_mid * (1 - 0.00035)
-                ask = new_mid * (1 + 0.00035)
-                self._mock_base = new_mid
-                self._apply_bbo(bid, ask, sequence=None)
+                # For ALL_PAIRS, update all tracked snapshots with small drift, seeding from live if available
+                if settings.market == "ALL_PAIRS":
+                    # Ensure snapshots for all active pairs
+                    try:
+                        from backend.strategy.market_limits import _cache
+                        if _cache:
+                            for m in list(_cache.keys())[:12]:
+                                if m not in self._snapshots:
+                                    self.get_snapshot_for(m)
+                    except Exception:
+                        pass
+                    markets_to_update = list(self._snapshots.keys())
+                    for m in markets_to_update:
+                        snap = self._snapshots[m]
+                        # Use live mid if recently updated via REST/WS, else mock
+                        base = snap.mid or self._mock_bases.get(m, MOCK_PRICES.get(m, 100))
+                        # If base is far from live (e.g., SOL 150 vs live 95), nudge toward live slowly
+                        try:
+                            from backend.strategy.market_limits import _cache as _c
+                            # live price not stored, but we have MOCK vs live: use REST to correct occasionally
+                            pass
+                        except Exception:
+                            pass
+                        drift = (random.random() - 0.5) * 0.0008  # ±0.04% smaller for multi-pair stability
+                        new_mid = base * (1 + drift)
+                        bid = new_mid * (1 - 0.00030)
+                        ask = new_mid * (1 + 0.00030)
+                        self._mock_bases[m] = new_mid
+                        self._apply_bbo_for(m, bid, ask, None)
+                else:
+                    base = self.snapshot.mid or self._mock_base
+                    drift = (random.random() - 0.5) * 0.0012
+                    new_mid = base * (1 + drift)
+                    bid = new_mid * (1 - 0.00035)
+                    ask = new_mid * (1 + 0.00035)
+                    self._mock_base = new_mid
+                    self._apply_bbo(bid, ask, sequence=None)
             await asyncio.sleep(0.35)
 
     async def start(self) -> None:
@@ -174,12 +263,25 @@ class MarketDataEngine:
         await self._client.close()
 
     def set_market(self, market: str) -> None:
+        if market == "ALL_PAIRS":
+            settings.market = "ALL_PAIRS"
+            # Ensure snapshots for all pairs
+            try:
+                from backend.strategy.market_limits import DEFAULTS
+                for m in list(DEFAULTS.keys()):
+                    self.get_snapshot_for(m)
+            except Exception:
+                pass
+            self._seed_mock()
+            return
         self.market = market
         self.market_id = MARKET_IDS.get(market, 1)
+        self.snapshot = self.get_snapshot_for(market)
         self.snapshot.market = market
         self.snapshot.market_id = self.market_id
         self._mock_base = MOCK_PRICES.get(market, 65000.0)
         self._seed_mock()
+        settings.market = market
 
     async def _ws_loop(self) -> None:
         backoff = 1.0

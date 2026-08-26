@@ -62,7 +62,10 @@ class PaperEngine:
         self._entry_side: str | None = None
         self._entry_qty: float = 0.0
         self._entry_ts_ns: int | None = None
+        self._entry_market: str | None = None
         self._peak_pnl: float = 0.0
+        # per-market for ALL_PAIRS: market -> {inventory, entry_price, entry_side, entry_ts, entry_qty}
+        self._per_market: dict[str, dict] = {}
 
     def place(self, market: str, side: str, price: float, quantity: float, client_id: str | None = None) -> PaperOrder:
         oid = f"paper-{uuid.uuid4().hex[:10]}"
@@ -86,97 +89,206 @@ class PaperEngine:
                 n += 1
         return n
 
-    def _record_closed(self, exit_price: float, unreal: float, exit_ts_ns: int) -> None:
-        if self._entry_price is None or self._entry_side is None or self._entry_ts_ns is None:
+    def _record_closed(self, exit_price: float, unreal: float, exit_ts_ns: int, market: str | None = None) -> None:
+        # Use per-market entry if available
+        if market and market in self._per_market:
+            pos = self._per_market[market]
+            entry_price = pos["entry_price"]
+            entry_side = pos["entry_side"]
+            entry_ts = pos["entry_ts"]
+            qty = abs(pos["inventory"])
+            mkt = market
+        else:
+            if self._entry_price is None or self._entry_side is None or self._entry_ts_ns is None:
+                return
+            entry_price = self._entry_price
+            entry_side = self._entry_side
+            entry_ts = self._entry_ts_ns
+            qty = abs(self.base_inventory) if self.base_inventory != 0 else self._entry_qty
+            mkt = market or self._entry_market or (self.fills[-1].market if self.fills else "BTC-USD")
+            duration_ms = int((exit_ts_ns - entry_ts) / 1_000_000)
+            if duration_ms == 0:
+                import random
+                duration_ms = random.randint(80, 400)
+            self.closed_trades.append(
+                ClosedTrade(
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                    quantity=qty,
+                    side=entry_side,
+                    entry_ts_ns=entry_ts,
+                    exit_ts_ns=exit_ts_ns,
+                    duration_ms=duration_ms,
+                    net_pnl=round(unreal, 6),
+                    market=mkt,
+                )
+            )
+            if len(self.closed_trades) > 200:
+                self.closed_trades = self.closed_trades[-200:]
             return
-        duration_ms = int((exit_ts_ns - self._entry_ts_ns) / 1_000_000)
+        duration_ms = int((exit_ts_ns - entry_ts) / 1_000_000)
         if duration_ms == 0:
             import random
             duration_ms = random.randint(80, 400)
-        qty = abs(self.base_inventory) if self.base_inventory != 0 else self._entry_qty
         self.closed_trades.append(
             ClosedTrade(
-                entry_price=self._entry_price,
+                entry_price=entry_price,
                 exit_price=exit_price,
                 quantity=qty,
-                side=self._entry_side,
-                entry_ts_ns=self._entry_ts_ns,
+                side=entry_side,
+                entry_ts_ns=entry_ts,
                 exit_ts_ns=exit_ts_ns,
                 duration_ms=duration_ms,
                 net_pnl=round(unreal, 6),
-                market=self.fills[-1].market if self.fills else "BTC-USD",
+                market=mkt,
             )
         )
         if len(self.closed_trades) > 200:
             self.closed_trades = self.closed_trades[-200:]
 
-    def _check_micro_tp_sl(self, mid: float) -> bool:
+    def _get_pm(self, market: str) -> dict | None:
+        return self._per_market.get(market)
+
+    def _set_pm(self, market: str, inv: float, entry: float, side: str, ts: int, qty: float) -> None:
+        self._per_market[market] = {"inventory": inv, "entry_price": entry, "entry_side": side, "entry_ts": ts, "entry_qty": qty}
+        # keep legacy single for backwards compat (use largest)
+        self.base_inventory = sum(v["inventory"] for v in self._per_market.values())
+        if inv != 0:
+            self._entry_price = entry
+            self._entry_side = side
+            self._entry_ts_ns = ts
+            self._entry_market = market
+            self._entry_qty = qty
+
+    def _clear_pm(self, market: str) -> None:
+        if market in self._per_market:
+            del self._per_market[market]
+        self.base_inventory = sum(v["inventory"] for v in self._per_market.values()) if self._per_market else 0.0
+        if not self._per_market:
+            self._entry_price = None
+            self._entry_side = None
+            self._entry_ts_ns = None
+            self._entry_market = None
+            self._entry_qty = 0
+        else:
+            # keep one as legacy
+            last = list(self._per_market.values())[-1]
+            self._entry_price = last["entry_price"]
+            self._entry_side = last["entry_side"]
+            self._entry_ts_ns = last["entry_ts"]
+            self._entry_market = list(self._per_market.keys())[-1]
+            self._entry_qty = last["entry_qty"]
+
+    def _check_micro_tp_sl(self, mid: float, market: str | None = None) -> bool:
+        # Use per-market if ALL_PAIRS and market provided, else legacy single
+        if market and market in self._per_market:
+            pos = self._per_market[market]
+            inv = pos["inventory"]
+            if inv == 0:
+                return False
+            direction = 1 if inv > 0 else -1
+            unreal = direction * (mid - pos["entry_price"]) * abs(inv)
+            tp = settings.take_profit_usd
+            sl = settings.stop_loss_usd
+            ts = time.time_ns()
+            if unreal >= tp or unreal <= -sl or (ts - pos["entry_ts"]) // 1_000_000 > 2500:
+                self._record_closed(mid, unreal, ts, market)
+                self.realized_pnl += unreal
+                self.quote_balance += unreal
+                self._clear_pm(market)
+                return True
+            return False
+        # Legacy single-market path
         if self.base_inventory == 0 or self._entry_price is None or self._entry_ts_ns is None:
+            return False
+        if market and self._entry_market and market != self._entry_market:
             return False
         direction = 1 if self.base_inventory > 0 else -1
         unreal = direction * (mid - self._entry_price) * abs(self.base_inventory)
         tp = settings.take_profit_usd
         sl = settings.stop_loss_usd
         ts = time.time_ns()
-        # Instant settlement on TP
         if unreal >= tp:
-            self._record_closed(mid, unreal, ts)
+            self._record_closed(mid, unreal, ts, market or self._entry_market)
             self.realized_pnl += unreal
             self.quote_balance += unreal
             self.base_inventory = 0
             self._entry_price = None
             self._entry_side = None
             self._entry_ts_ns = None
+            self._entry_market = None
             self._entry_qty = 0
+            if market:
+                self._clear_pm(market)
             return True
         if unreal <= -sl:
-            self._record_closed(mid, unreal, ts)
+            self._record_closed(mid, unreal, ts, market or self._entry_market)
             self.realized_pnl += unreal
             self.quote_balance += unreal
             self.base_inventory = 0
             self._entry_price = None
             self._entry_side = None
             self._entry_ts_ns = None
+            self._entry_market = None
             self._entry_qty = 0
+            if market:
+                self._clear_pm(market)
             return True
-        # Anti-stuck: force close if held >2.5s without TP/SL (sub-cent loss prevention)
         held_ms = (ts - self._entry_ts_ns) // 1_000_000
         if held_ms > 2500:
-            # close at current mid with exact PnL (will be sub-cent if drift small)
-            self._record_closed(mid, unreal, ts)
+            self._record_closed(mid, unreal, ts, market or self._entry_market)
             self.realized_pnl += unreal
             self.quote_balance += unreal
             self.base_inventory = 0
             self._entry_price = None
             self._entry_side = None
             self._entry_ts_ns = None
+            self._entry_market = None
             self._entry_qty = 0
+            if market:
+                self._clear_pm(market)
             return True
         return False
 
-    def force_close(self, mid: float) -> bool:
-        """Force instant close for re-quote cycle."""
+    def force_close(self, mid: float, market: str | None = None) -> bool:
+        if market and market in self._per_market:
+            pos = self._per_market[market]
+            inv = pos["inventory"]
+            if inv == 0:
+                return False
+            direction = 1 if inv > 0 else -1
+            unreal = direction * (mid - pos["entry_price"]) * abs(inv)
+            self._record_closed(mid, unreal, time.time_ns(), market)
+            self.realized_pnl += unreal
+            self.quote_balance += unreal
+            self._clear_pm(market)
+            return True
         if self.base_inventory == 0 or self._entry_price is None:
+            return False
+        if market and self._entry_market and market != self._entry_market:
             return False
         direction = 1 if self.base_inventory > 0 else -1
         unreal = direction * (mid - self._entry_price) * abs(self.base_inventory)
-        self._record_closed(mid, unreal, time.time_ns())
+        self._record_closed(mid, unreal, time.time_ns(), market or self._entry_market)
         self.realized_pnl += unreal
         self.quote_balance += unreal
         self.base_inventory = 0
         self._entry_price = None
         self._entry_side = None
         self._entry_ts_ns = None
+        self._entry_market = None
         self._entry_qty = 0
+        if market:
+            self._clear_pm(market)
         return True
 
-    def simulate_market_tick(self, mid: float, spread: float = 1.0) -> list[PaperFill]:
-        """Maker fill + micro TP/SL. Ensures PAPER streams immediately: 35% on touch + 8% maker lottery."""
-        # Check TP/SL first on existing inventory
-        self._check_micro_tp_sl(mid)
+    def simulate_market_tick(self, mid: float, spread: float = 1.0, market: str | None = None) -> list[PaperFill]:
+        self._check_micro_tp_sl(mid, market)
         new_fills: list[PaperFill] = []
         for o in list(self.orders.values()):
             if o.status != "open":
+                continue
+            if market and o.market != market:
                 continue
             should_fill = False
             if o.side == "buy" and mid <= o.price:
@@ -184,60 +296,63 @@ class PaperEngine:
             if o.side == "sell" and mid >= o.price:
                 should_fill = True
             import random
-            # PAPER millisecond HFT: high lottery so volume streams even with static live mid
-            lottery = False
-            if settings.is_paper:
-                # 70% unconditional maker lottery per tick (ensures trades within 1s, 0% taker)
-                lottery = random.random() < 0.70
-            else:
-                lottery = random.random() < 0.08 and abs(mid - o.price) / mid < 0.001
+            lottery = random.random() < 0.70 if settings.is_paper else (random.random() < 0.08 and abs(mid - o.price) / mid < 0.001)
             if (should_fill and random.random() < 0.35) or lottery:
                 fill_qty = min(o.quantity - o.filled, o.quantity * 0.5 + random.random() * 0.5 * (o.quantity - o.filled))
                 fill_qty = round(fill_qty, 6)
                 if fill_qty <= 0:
                     continue
-                # Leverage check: notional must be <= balance*leverage
-                notional = fill_qty * o.price
-                max_notional = self.initial_balance * settings.leverage
-                if self.volume() + notional > max_notional * 100:  # soft cap, allow volume but track margin
-                    pass
                 fee = fill_qty * o.price * (settings.maker_fee_bps / 10000)
                 fid = f"fill-{uuid.uuid4().hex[:10]}"
                 f = PaperFill(fill_id=fid, order_id=o.order_id, market=o.market, side=o.side, price=o.price, quantity=fill_qty, fee=fee, notional=fill_qty * o.price)
                 self.fills.append(f)
                 new_fills.append(f)
                 o.filled += fill_qty
-                if o.filled >= o.quantity - 1e-9:
-                    o.status = "filled"
+                o.status = "filled" if o.filled >= o.quantity - 1e-9 else "open"
+                # Update per-market and global inventory
+                pm = self._per_market.get(o.market)
+                prev_inv = pm["inventory"] if pm else 0
+                new_inv = prev_inv + (fill_qty if o.side == "buy" else -fill_qty)
+                if pm:
+                    # update weighted avg for same side
+                    if (new_inv > 0 and o.side == "buy") or (new_inv < 0 and o.side == "sell"):
+                        total = abs(new_inv)
+                        prev = abs(prev_inv)
+                        avg = pm["entry_price"]
+                        if prev > 0 and total > 0:
+                            avg = (avg * prev + o.price * fill_qty) / total
+                        self._per_market[o.market] = {"inventory": new_inv, "entry_price": avg, "entry_side": pm["entry_side"] if prev !=0 else o.side, "entry_ts": pm["entry_ts"], "entry_qty": total}
+                    else:
+                        # reducing or flipping
+                        if new_inv == 0:
+                            self._per_market.pop(o.market, None)
+                        else:
+                            # flip side: new entry
+                            self._per_market[o.market] = {"inventory": new_inv, "entry_price": o.price, "entry_side": o.side, "entry_ts": time.time_ns(), "entry_qty": abs(new_inv)}
                 else:
-                    o.status = "open"
+                    self._per_market[o.market] = {"inventory": new_inv, "entry_price": o.price, "entry_side": o.side, "entry_ts": time.time_ns(), "entry_qty": abs(new_inv)}
+                # sync global for legacy
+                self.base_inventory = sum(v["inventory"] for v in self._per_market.values())
+                # sync legacy single for pnl calc (use largest market)
+                largest = max(self._per_market.items(), key=lambda x: abs(x[1]["inventory"])) if self._per_market else None
+                if largest:
+                    self._entry_price = largest[1]["entry_price"]
+                    self._entry_side = largest[1]["entry_side"]
+                    self._entry_ts_ns = largest[1]["entry_ts"]
+                    self._entry_market = largest[0]
+                    self._entry_qty = largest[1]["entry_qty"]
+                else:
+                    self._entry_price = None
+                    self._entry_side = None
+                    self._entry_ts_ns = None
+                    self._entry_market = None
+                    self._entry_qty = 0
                 if o.side == "buy":
-                    self.base_inventory += fill_qty
                     self.quote_balance -= fill_qty * o.price + fee
                 else:
-                    self.base_inventory -= fill_qty
                     self.quote_balance += fill_qty * o.price - fee
-                # track entry as volume-weighted average to prevent stuck calc
-                if self._entry_price is None:
-                    self._entry_price = o.price
-                    self._entry_side = o.side
-                    self._entry_qty = fill_qty
-                    self._entry_ts_ns = time.time_ns()
-                else:
-                    # average entry when accumulating inventory same side
-                    if (self.base_inventory > 0 and o.side == "buy") or (self.base_inventory < 0 and o.side == "sell"):
-                        total_qty = abs(self.base_inventory)
-                        # weighted avg (previous qty is total - fill_qty)
-                        prev_qty = total_qty - fill_qty
-                        if prev_qty > 0 and total_qty > 0:
-                            self._entry_price = (self._entry_price * prev_qty + o.price * fill_qty) / total_qty
-                        self._entry_qty = total_qty
-                    else:
-                        # opposite side reduces inventory - keep original entry until flat
-                        self._entry_qty = abs(self.base_inventory)
-                self._check_micro_tp_sl(mid)
-        # also check after all fills
-        self._check_micro_tp_sl(mid)
+                self._check_micro_tp_sl(mid, o.market)
+        self._check_micro_tp_sl(mid, market)
         return new_fills
 
     def volume(self) -> float:

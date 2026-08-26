@@ -8,16 +8,22 @@ export default function TradingControls(){
   const [lev,setLev]=useState<string>('')
   const [msg,setMsg]=useState<string|null>(null)
 
+  const [limits,setLimits]=useState<any>({})
   const load=async()=>{
     try{
       const j=await api.getSettings()
+      // fetch all perp pairs with max leverage directly from live Arcus
+      try{
+        const lim=await fetch('/api/markets/limits').then(r=>r.json())
+        if(lim.limits){ j._limits=lim.limits; setLimits(lim.limits); // also update supported_markets to live list
+          const liveMarkets=Object.keys(lim.limits).sort()
+          if(liveMarkets.length) j.supported_markets=liveMarkets
+        }
+      }catch{}
       setS(j)
-      // fetch limits for max leverage display
-      try{ const lim=await fetch('/api/markets/limits').then(r=>r.json()); if(lim.limits) j._limits=lim.limits }catch{}
-      setS({...j})
     }catch{}
   }
-  useEffect(()=>{ load() },[])
+  useEffect(()=>{ load(); const id=setInterval(load,10000); return()=>clearInterval(id)},[])
   if(!s) return <div className="p-5 bg-slate-900 border border-slate-800 rounded-2xl">Loading controls…</div>
 
   const maxLev = s.max_leverage_for_pair || 10
@@ -84,7 +90,11 @@ export default function TradingControls(){
         <div className="bg-slate-800/50 p-3 rounded-xl border border-slate-700">
           <div className="text-xs text-slate-400">Live Pair & Micro Risk</div>
           <select value={s.market} onChange={e=>setMarket(e.target.value)} className="w-full mt-2 bg-slate-900 border border-slate-700 rounded px-2 py-1.5 text-sm">
-            {(s.supported_markets||[]).map((m:string)=><option key={m} value={m}>{m} {m===s.market?`· max ${maxLev}x`:''}</option>)}
+            <option value="ALL_PAIRS">ALL PAIRS (Auto Multi-Pair) — maximize volume</option>
+            {(s.supported_markets||[]).map((m:string)=>{
+              const lev = limits[m]?.max_leverage || (m.includes('BTC')?20:m.includes('ETH')?15:m.includes('SOL')?10:5)
+              return <option key={m} value={m}>{m} (Max {lev}x)</option>
+            })}
           </select>
           <div className="text-xs mt-2">TP ${Number(s.take_profit_usd).toFixed(3)} · SL ${Number(s.stop_loss_usd).toFixed(3)} &lt;$0.01 strict</div>
           <div className="flex gap-2 mt-2">
