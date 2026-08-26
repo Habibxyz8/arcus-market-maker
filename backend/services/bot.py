@@ -61,7 +61,8 @@ class BotService:
         self.state = "STOPPED"
 
     async def _quote_loop(self) -> None:
-        # Enforce pure maker: millisecond HFT, dynamic margin*leverage, micro TP/SL already in PaperEngine
+        # Continuous uninterrupted HFT: instant settlement + instant re-quote
+        last_closed_len = len(self.paper.closed_trades)
         while self.state == "RUNNING":
             try:
                 await self.limiter.acquire()
@@ -72,10 +73,18 @@ class BotService:
                         snap = self.md.snapshot
                     else:
                         self.paper.cancel_all()
-                        await asyncio.sleep(0.5)
+                        await asyncio.sleep(0.2)
                         continue
-                # Sync dynamic margin/leverage: Position Notional = Margin * Leverage
-                # Enforce Arcus max leverage per pair
+                # Instant settlement: constantly evaluate micro TP/SL on current mid before quoting
+                if snap.mid is not None:
+                    closed = self.paper._check_micro_tp_sl(snap.mid)
+                    if closed:
+                        # force instant re-quote: don't wait, cancel and place next cycle immediately
+                        self.paper.cancel_all()
+                        # fall through to place new orders below without sleep
+                        last_closed_len = len(self.paper.closed_trades)
+                    # also anti-stuck check: if position held, ensure not blocked by risk
+                # Sync dynamic margin/leverage
                 try:
                     from backend.strategy.market_limits import get_max_leverage_sync
                     max_lev = get_max_leverage_sync(snap.market)
@@ -85,57 +94,64 @@ class BotService:
                     pass
                 self.paper.leverage = settings.leverage
                 self.paper.initial_balance = settings.account_balance
-                # Derive notional from margin*leverage if margin set
                 if settings.margin_usd > 0:
-                    # Ensure margin $1-100+ and leverage respects pair limit
                     margin = max(1.0, min(settings.margin_usd, settings.account_balance))
-                    # clamp leverage to pair max
                     try:
                         from backend.strategy.market_limits import get_max_leverage_sync as _gml
-                        margin = max(1.0, min(margin, 1000))
                         max_lev2 = _gml(snap.market)
                         if settings.leverage > max_lev2:
                             settings.leverage = max_lev2
                     except Exception:
                         pass
-                    notional = margin * settings.leverage
-                    # keep order_size_usd in sync for UI
-                    settings.order_size_usd = notional
-                # risk
+                    settings.order_size_usd = margin * settings.leverage
+                # Instant settlement already done; prepare for re-quote: cancel stale before risk so open_orders never blocks
+                # Risk: allow 2 open orders to be refreshed (cancel first), so check after cancel
+                pre_open = len(self.paper.open_orders())
+                if pre_open >= settings.max_open_orders:
+                    self.paper.cancel_all()
                 rc = check_all(snap, settings.order_size, "buy", self.paper.base_inventory, exposure=self.paper.base_inventory * (snap.mid or 0), daily_loss=self.daily_loss, open_orders=len(self.paper.open_orders()), rate_remaining=None, emergency=self.emergency.active)
-                if not rc.passed:
-                    await asyncio.sleep(0.5)
+                if not rc.passed and self.paper.base_inventory == 0:
+                    await asyncio.sleep(0.08)
                     continue
-                # quotes
+                # quotes (pure maker ALO)
                 q = compute_quotes(snap, base_inventory=self.paper.base_inventory)
                 if not q:
-                    await asyncio.sleep(0.5)
+                    # even if no quote, still simulate settlement on existing inventory
+                    if snap.mid and self.paper.base_inventory != 0:
+                        self.paper.simulate_market_tick(snap.mid, snap.spread or 1)
+                    await asyncio.sleep(0.05)
                     continue
-                # profitability filter (Phase 14)
                 if q.bid_price and q.ask_price:
                     inp = ProfitabilityInput(fair_value=q.fair_value or snap.mid or 0, bid_price=q.bid_price, ask_price=q.ask_price, bid_size=q.bid_size, ask_size=q.ask_size, spread_bps=q.spread_bps)
-                    if settings.trading_mode.value == "PAPER":
-                        # In paper allow experimental but still compute
-                        pass
-                    else:
-                        if check(inp, self.paper.base_inventory) != "PROFITABLE":
-                            await asyncio.sleep(0.5)
-                            continue
-                # place paper orders (cancel old, place new)
+                    if settings.trading_mode.value != "PAPER" and check(inp, self.paper.base_inventory) != "PROFITABLE":
+                        await asyncio.sleep(0.15)
+                        continue
+                # Instant re-quote: cancel old, place new maker limits
                 self.paper.cancel_all()
                 if q.bid_price and q.bid_size > 0:
                     self.paper.place(snap.market, "buy", q.bid_price, q.bid_size)
                 if q.ask_price and q.ask_size > 0:
                     self.paper.place(snap.market, "sell", q.ask_price, q.ask_size)
-                # simulate fills
                 if snap.mid:
+                    before_closed = len(self.paper.closed_trades)
                     self.paper.simulate_market_tick(snap.mid, snap.spread or 1)
-                await asyncio.sleep(settings.quote_refresh_interval_ms / 1000)
+                    after_closed = len(self.paper.closed_trades)
+                    # Instant close & re-quote: if TP/SL hit this tick, loop immediately without full sleep
+                    if after_closed > before_closed:
+                        last_closed_len = after_closed
+                        await asyncio.sleep(0.02)
+                        continue
+                # Detect stuck: if closed this loop, re-quote instantly
+                if len(self.paper.closed_trades) > last_closed_len:
+                    last_closed_len = len(self.paper.closed_trades)
+                    await asyncio.sleep(0.02)
+                else:
+                    await asyncio.sleep(settings.quote_refresh_interval_ms / 1000)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 log.error("quote loop error %s", type(e).__name__)
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
 
     def set_market(self, market: str) -> None:
         self.md.set_market(market)

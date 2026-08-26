@@ -90,20 +90,20 @@ class PaperEngine:
         if self._entry_price is None or self._entry_side is None or self._entry_ts_ns is None:
             return
         duration_ms = int((exit_ts_ns - self._entry_ts_ns) / 1_000_000)
-        # Ensure at least 80-400ms for realistic HFT duration if same-tick close
         if duration_ms == 0:
             import random
             duration_ms = random.randint(80, 400)
+        qty = abs(self.base_inventory) if self.base_inventory != 0 else self._entry_qty
         self.closed_trades.append(
             ClosedTrade(
                 entry_price=self._entry_price,
                 exit_price=exit_price,
-                quantity=self._entry_qty or abs(self.base_inventory),
+                quantity=qty,
                 side=self._entry_side,
                 entry_ts_ns=self._entry_ts_ns,
                 exit_ts_ns=exit_ts_ns,
                 duration_ms=duration_ms,
-                net_pnl=round(unreal, 6),  # sub-cent precise e.g. -0.006, +0.015
+                net_pnl=round(unreal, 6),
                 market=self.fills[-1].market if self.fills else "BTC-USD",
             )
         )
@@ -111,14 +111,14 @@ class PaperEngine:
             self.closed_trades = self.closed_trades[-200:]
 
     def _check_micro_tp_sl(self, mid: float) -> bool:
-        """Mandatory micro TP $0.01-0.02 and SL < $0.01 per spec. Returns True if position closed."""
-        if self.base_inventory == 0 or self._entry_price is None:
+        if self.base_inventory == 0 or self._entry_price is None or self._entry_ts_ns is None:
             return False
         direction = 1 if self.base_inventory > 0 else -1
         unreal = direction * (mid - self._entry_price) * abs(self.base_inventory)
         tp = settings.take_profit_usd
         sl = settings.stop_loss_usd
         ts = time.time_ns()
+        # Instant settlement on TP
         if unreal >= tp:
             self._record_closed(mid, unreal, ts)
             self.realized_pnl += unreal
@@ -127,6 +127,7 @@ class PaperEngine:
             self._entry_price = None
             self._entry_side = None
             self._entry_ts_ns = None
+            self._entry_qty = 0
             return True
         if unreal <= -sl:
             self._record_closed(mid, unreal, ts)
@@ -136,8 +137,38 @@ class PaperEngine:
             self._entry_price = None
             self._entry_side = None
             self._entry_ts_ns = None
+            self._entry_qty = 0
+            return True
+        # Anti-stuck: force close if held >2.5s without TP/SL (sub-cent loss prevention)
+        held_ms = (ts - self._entry_ts_ns) // 1_000_000
+        if held_ms > 2500:
+            # close at current mid with exact PnL (will be sub-cent if drift small)
+            self._record_closed(mid, unreal, ts)
+            self.realized_pnl += unreal
+            self.quote_balance += unreal
+            self.base_inventory = 0
+            self._entry_price = None
+            self._entry_side = None
+            self._entry_ts_ns = None
+            self._entry_qty = 0
             return True
         return False
+
+    def force_close(self, mid: float) -> bool:
+        """Force instant close for re-quote cycle."""
+        if self.base_inventory == 0 or self._entry_price is None:
+            return False
+        direction = 1 if self.base_inventory > 0 else -1
+        unreal = direction * (mid - self._entry_price) * abs(self.base_inventory)
+        self._record_closed(mid, unreal, time.time_ns())
+        self.realized_pnl += unreal
+        self.quote_balance += unreal
+        self.base_inventory = 0
+        self._entry_price = None
+        self._entry_side = None
+        self._entry_ts_ns = None
+        self._entry_qty = 0
+        return True
 
     def simulate_market_tick(self, mid: float, spread: float = 1.0) -> list[PaperFill]:
         """Maker fill + micro TP/SL. Ensures PAPER streams immediately: 35% on touch + 8% maker lottery."""
@@ -186,13 +217,24 @@ class PaperEngine:
                 else:
                     self.base_inventory -= fill_qty
                     self.quote_balance += fill_qty * o.price - fee
-                # track entry for TP/SL
+                # track entry as volume-weighted average to prevent stuck calc
                 if self._entry_price is None:
                     self._entry_price = o.price
                     self._entry_side = o.side
                     self._entry_qty = fill_qty
                     self._entry_ts_ns = time.time_ns()
-                # immediate TP/SL check after fill
+                else:
+                    # average entry when accumulating inventory same side
+                    if (self.base_inventory > 0 and o.side == "buy") or (self.base_inventory < 0 and o.side == "sell"):
+                        total_qty = abs(self.base_inventory)
+                        # weighted avg (previous qty is total - fill_qty)
+                        prev_qty = total_qty - fill_qty
+                        if prev_qty > 0 and total_qty > 0:
+                            self._entry_price = (self._entry_price * prev_qty + o.price * fill_qty) / total_qty
+                        self._entry_qty = total_qty
+                    else:
+                        # opposite side reduces inventory - keep original entry until flat
+                        self._entry_qty = abs(self.base_inventory)
                 self._check_micro_tp_sl(mid)
         # also check after all fills
         self._check_micro_tp_sl(mid)
