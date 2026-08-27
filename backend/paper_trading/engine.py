@@ -290,12 +290,18 @@ class PaperEngine:
             should_fill = False
             # Tight spread: allow 1 tick tolerance for realistic touch
             tol = max(0.5, o.price * 0.00005)  # 0.5 points or 0.005% tolerance
+            # Band within which taker flow can sweep a resting maker quote (the touch).
+            band = max(1.0, o.price * 0.002)  # ~0.2% around mid
             if o.side == "buy":
                 if mid <= o.price + tol or (ask is not None and ask <= o.price + tol):
                     should_fill = True
+                elif abs(mid - o.price) <= band:
+                    should_fill = True  # resting bid gets hit by incoming sell flow
             else:
                 if mid >= o.price - tol or (bid is not None and bid >= o.price - tol):
                     should_fill = True
+                elif abs(mid - o.price) <= band:
+                    should_fill = True  # resting ask gets hit by incoming buy flow
             age_ms = (time.time_ns() - o.created_ns) // 1_000_000
             if should_fill and age_ms < 25:
                 if random.random() > 0.85:

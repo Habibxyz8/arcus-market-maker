@@ -174,12 +174,13 @@ class BotService:
                         if settings.trading_mode.value != "PAPER" and check(inp, self.paper.base_inventory) != "PROFITABLE":
                             await asyncio.sleep(0.05)
                             continue
-                    # Enforce $100 margin limit: check total used would not exceed margin_usd
+                    # Enforce the hard $100 account-balance limit: used margin must stay
+                    # within the equity, never the tiny per-cycle margin_usd budget.
                     est_notional_bid = q.bid_price * q.bid_size if q.bid_price and q.bid_size else 0
                     est_notional_ask = q.ask_price * q.ask_size if q.ask_price and q.ask_size else 0
                     est_used = self.paper.used_margin(snap.mid) + (est_notional_bid + est_notional_ask) / max(settings.leverage, 1)
-                    if est_used > settings.margin_usd + 1e-6:
-                        self._set_status(f"MARGIN LIMIT ${settings.margin_usd:.0f} hit ({est_used:.2f}>{settings.margin_usd:.0f})")
+                    if est_used > settings.account_balance + 1e-6:
+                        self._set_status(f"EXPOSURE LIMIT ${settings.account_balance:.0f} hit ({est_used:.2f}>{settings.account_balance:.0f})")
                         await asyncio.sleep(0.5)
                         continue
                     if settings.is_paper:
