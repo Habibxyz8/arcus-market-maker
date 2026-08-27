@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import time
+import uuid
 from typing import Any
 
+from backend.arcus.client import ArcusClient
 from backend.config.settings import settings
-from backend.market_data.engine import MarketDataEngine
+from backend.execution.order_manager import OrderManager, OrderState
+from backend.market_data.engine import MARKET_IDS, MarketDataEngine
 from backend.paper_trading.engine import PaperEngine
 from backend.profitability.engine import ProfitabilityInput, check, estimate
 from backend.risk.emergency import EmergencyManager
@@ -16,11 +20,16 @@ from backend.monitoring.logger import get_logger
 
 log = get_logger(__name__)
 
+# Max age (ms) before an unfilled real order is considered stale and cancelled.
+MAX_ORDER_AGE_MS = 8000
+
 
 class BotService:
     def __init__(self) -> None:
         self.md = MarketDataEngine()
         self.paper = PaperEngine()
+        self.client = ArcusClient()
+        self.om = OrderManager()
         self.emergency = EmergencyManager()
         self.limiter = RateLimiter()
         self.state: str = "STOPPED"
@@ -28,6 +37,7 @@ class BotService:
         self.daily_loss: float = 0.0
         self.execution_status: str = "IDLE"
         self.active_markets: list[str] = []
+        self._seen_fills: set[str] = set()
 
     async def start(self) -> None:
         if self.emergency.active:
@@ -71,6 +81,7 @@ class BotService:
         self.emergency.trigger(reason)
         self.state = "EMERGENCY"
         self.paper.cancel_all()
+        await self._flatten_real()
         if self._quote_task:
             self._quote_task.cancel()
         log.warning("EMERGENCY_STOP quotes cancelled")
@@ -171,29 +182,40 @@ class BotService:
                         self._set_status(f"MARGIN LIMIT ${settings.margin_usd:.0f} hit ({est_used:.2f}>{settings.margin_usd:.0f})")
                         await asyncio.sleep(0.5)
                         continue
-                    self._set_status(f"PLACING ORDER {market} BID {q.bid_price:.2f} ASK {q.ask_price:.2f}" if q.bid_price and q.ask_price else f"PLACING {market}")
-                    for o in list(self.paper.orders.values()):
-                        if o.market == market and o.status == "open":
-                            o.status = "canceled"
-                    if q.bid_price and q.bid_size > 0:
-                        self.paper.place(market, "buy", q.bid_price, q.bid_size)
-                    if q.ask_price and q.ask_size > 0:
-                        self.paper.place(market, "sell", q.ask_price, q.ask_size)
-                    if snap.mid:
-                        before_closed = len(self.paper.closed_trades)
-                        fills = self.paper.simulate_market_tick(snap.mid, snap.spread or 1, market, snap.bid, snap.ask)
-                        if fills:
-                            self._set_status(f"ORDER FILLED {market} {fills[0].side.upper()} {fills[0].quantity:.6f}")
-                        after_closed = len(self.paper.closed_trades)
-                        if after_closed > before_closed:
-                            self._set_status(f"RE-OPENING CYCLE {market} PnL {self.paper.closed_trades[-1].net_pnl:+.3f}")
-                            last_closed_len = after_closed
+                    if settings.is_paper:
+                        self._set_status(f"PLACING ORDER {market} BID {q.bid_price:.2f} ASK {q.ask_price:.2f}" if q.bid_price and q.ask_price else f"PLACING {market}")
+                        for o in list(self.paper.orders.values()):
+                            if o.market == market and o.status == "open":
+                                o.status = "canceled"
+                        if q.bid_price and q.bid_size > 0:
+                            self.paper.place(market, "buy", q.bid_price, q.bid_size)
+                        if q.ask_price and q.ask_size > 0:
+                            self.paper.place(market, "sell", q.ask_price, q.ask_size)
+                        if snap.mid:
+                            before_closed = len(self.paper.closed_trades)
+                            fills = self.paper.simulate_market_tick(snap.mid, snap.spread or 1, market, snap.bid, snap.ask)
+                            if fills:
+                                self._set_status(f"ORDER FILLED {market} {fills[0].side.upper()} {fills[0].quantity:.6f}")
+                            after_closed = len(self.paper.closed_trades)
+                            if after_closed > before_closed:
+                                self._set_status(f"RE-OPENING CYCLE {market} PnL {self.paper.closed_trades[-1].net_pnl:+.3f}")
+                                last_closed_len = after_closed
+                                await asyncio.sleep(0.12)
+                                continue
+                        if len(self.paper.closed_trades) > last_closed_len:
+                            last_closed_len = len(self.paper.closed_trades)
                             await asyncio.sleep(0.12)
                             continue
-                    if len(self.paper.closed_trades) > last_closed_len:
-                        last_closed_len = len(self.paper.closed_trades)
-                        await asyncio.sleep(0.12)
-                        continue
+                    else:
+                        # Real execution path (TESTNET / LIVE): place real orders and
+                        # ingest real fills into the shared paper ledger for PnL/TP-SL.
+                        await self._exec_real(market, q, snap)
+                    # Hard equity floor: never allow the $100 balance to breach the floor.
+                    equity = self.paper.equity(snap.mid)
+                    if equity <= settings.equity_floor_usd:
+                        log.warning("EQUITY FLOOR HIT equity=%.4f", equity)
+                        await self.emergency_stop("EQUITY FLOOR")
+                        break
                 # Speed limit: natural volatility pacing, not millisecond spam
                 await asyncio.sleep(settings.quote_refresh_interval_ms / 1000)
             except asyncio.CancelledError:
@@ -208,6 +230,111 @@ class BotService:
             log.info("EXEC %s", msg)
         except Exception:
             pass
+
+    @staticmethod
+    def _extract(obj: Any, keys: list[str]) -> Any:
+        if not isinstance(obj, dict):
+            return None
+        for k in keys:
+            if k in obj and obj[k] is not None:
+                return obj[k]
+        return None
+
+    async def _flatten_real(self, market: str | None = None) -> None:
+        """Cancel every tracked real order (optionally for a single market)."""
+        for oid, ostate in list(self.om.orders.items()):
+            if market and ostate.market != market:
+                continue
+            try:
+                await self.client.cancel_order(
+                    MARKET_IDS.get(ostate.market, 1),
+                    order_id=ostate.order_id,
+                    client_id=ostate.client_id,
+                )
+            except Exception as e:
+                log.warning("cancel_order failed %s: %s", oid, e)
+            await self.om.on_cancel(oid)
+
+    async def _exec_real(self, market: str, q, snap) -> None:
+        """Place real limit orders and reconcile real fills into the ledger.
+
+        Activates only when API credentials are configured. Without credentials
+        it idles safely (no simulated/fake fills).
+        """
+        if not settings.has_credentials():
+            self._set_status(f"REAL MODE: NO CREDENTIALS - idle {market}")
+            return
+        market_id = MARKET_IDS.get(market, 1)
+        try:
+            client = self.client
+            # 1) Cancel stale / off-quote real orders for this market.
+            for oid, ostate in list(self.om.orders.items()):
+                if ostate.market != market:
+                    continue
+                age_ms = (time.time_ns() - ostate.created_ns) // 1_000_000
+                ref = q.bid_price if ostate.side == "buy" else q.ask_price
+                far = ostate.price and ref and abs(ostate.price - ref) > max(0.5, ostate.price * 0.001)
+                if age_ms > MAX_ORDER_AGE_MS or far:
+                    try:
+                        await client.cancel_order(market_id, order_id=oid, client_id=ostate.client_id)
+                    except Exception as e:
+                        log.warning("cancel_order failed %s: %s", oid, e)
+                    await self.om.on_cancel(oid)
+            # 2) Place fresh two-sided maker (ALO) quotes if none open for this market.
+            open_for_market = [o for o in self.om.orders.values() if o.market == market and o.status == "open"]
+            if not open_for_market:
+                pending = []
+                if q.bid_price and q.bid_size > 0:
+                    pending.append(("buy", q.bid_price, q.bid_size))
+                if q.ask_price and q.ask_size > 0:
+                    pending.append(("sell", q.ask_price, q.ask_size))
+                for side, price, size in pending:
+                    cid = self.om.new_client_id()
+                    ostate = OrderState(
+                        order_id=cid, client_id=cid, market=market, side=side,
+                        price=price, quantity=size, status="open", created_ns=time.time_ns(),
+                    )
+                    try:
+                        await client.place_order(
+                            market_id, side.upper(), "LIMIT", str(size), str(price),
+                            time_in_force="ALO", client_id=cid,
+                        )
+                        await self.om.track(ostate)
+                    except Exception as e:
+                        log.error("place_order failed %s %s: %s", market, side, e)
+            # 3) Reconcile real fills into the shared ledger.
+            try:
+                fills = await client.get_fills() or []
+                before_closed = len(self.paper.closed_trades)
+                for fdata in fills:
+                    if not isinstance(fdata, dict):
+                        continue
+                    fm_id = self._extract(fdata, ["marketId", "market_id"])
+                    if fm_id is not None and int(fm_id) != market_id:
+                        continue
+                    fid = str(self._extract(fdata, ["fillId", "id", "fill_id"]) or uuid.uuid4().hex)
+                    if fid in self._seen_fills:
+                        continue
+                    self._seen_fills.add(fid)
+                    side = str(self._extract(fdata, ["side"]) or "buy").lower()
+                    price = float(self._extract(fdata, ["avgPrice", "price", "fillPrice"]) or 0)
+                    qty = float(self._extract(fdata, ["filledQty", "qty", "quantity", "size"]) or 0)
+                    fee = float(self._extract(fdata, ["fee"]) or 0)
+                    oid = str(self._extract(fdata, ["orderId", "order_id", "clientId", "client_id"]) or "")
+                    applied = self.paper.apply_real_fill(
+                        market, side, price, qty, fee, snap.mid or price,
+                        fill_id=fid, order_id=oid or None,
+                    )
+                    if applied:
+                        self._set_status(f"REAL FILL {market} {side.upper()} {qty:.6f} @ {price:.2f}")
+                # A position closed via TP/SL on real fills -> flatten remaining real orders.
+                if len(self.paper.closed_trades) > before_closed and self.paper.base_inventory == 0:
+                    self._set_status(f"REAL TP/SL CLOSED {market} - flattening")
+                    await self._flatten_real(market)
+            except Exception as e:
+                log.warning("get_fills failed %s: %s", market, e)
+        except Exception as e:
+            log.error("exec_real error %s: %s", market, e)
 
     def set_market(self, market: str) -> None:
         self.md.set_market(market)

@@ -98,8 +98,8 @@ class MarketDataEngine:
                             self._mock_bases[sym] = oracle
                             self._apply_bbo_for(sym, oracle*0.9999, oracle*1.0001, None)
                     return
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.warning("REST all-markets fetch failed %s", type(e).__name__)
             # Single market path
             try:
                 bbo = await self._client.get_bbo(self.market_id)
@@ -110,8 +110,8 @@ class MarketDataEngine:
                     # sync mock base to live
                     self._mock_bases[self.market] = (bid+ask)/2
                     return
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning("REST bbo fetch failed %s", type(e).__name__)
             mkts = await self._client.get_markets(self.market)
             m = (mkts.get("markets") or [])[0] if isinstance(mkts, dict) else None
             if m:
@@ -240,12 +240,36 @@ class MarketDataEngine:
             await asyncio.wait_for(self._fetch_rest_snapshot(), timeout=2.0)
         except asyncio.TimeoutError:
             pass
+        # Concurrent REST polling keeps data fresh even if the WS parser misses/stalls.
+        self._rest_task = asyncio.create_task(self._rest_poll_loop())
         # WS loop with reconnect (keep for TESTNET/LIVE; also runs in PAPER but mock covers)
         self._ws_task = asyncio.create_task(self._ws_loop())
 
+    async def _rest_poll_loop(self) -> None:
+        while self._running:
+            try:
+                await self._fetch_rest_snapshot()
+                try:
+                    lp = await self._client.get_live_prices()
+                    lst = lp.get("prices") or lp.get("markets") or []
+                    for p in lst if isinstance(lst, list) else []:
+                        if isinstance(p, dict) and (p.get("market") == self.market or p.get("marketDisplayName") == self.market):
+                            bid = p.get("bid") or p.get("bestBid")
+                            ask = p.get("ask") or p.get("bestAsk")
+                            if bid and ask:
+                                self._apply_bbo(float(bid), float(ask), None)
+                                break
+                except Exception as e:
+                    log.warning("livePrices poll failed %s", type(e).__name__)
+                if self.is_stale():
+                    log.warning(MARKET_DATA_STALE + " %s", self.market)
+            except Exception as e:
+                log.warning("REST poll loop error %s", type(e).__name__)
+            await asyncio.sleep(1)
+
     async def stop(self) -> None:
         self._running = False
-        for t in (self._ws_task, self._synthetic_task):
+        for t in (self._ws_task, self._synthetic_task, getattr(self, "_rest_task", None)):
             if t:
                 t.cancel()
                 try:
@@ -290,8 +314,8 @@ class MarketDataEngine:
                                f'{{"op":"subscribe","args":["bbo.{self.market}"]}}']:
                         try:
                             await ws.send(ch)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            log.debug("WS subscribe send failed %s", type(e).__name__)
                     backoff = 1.0
                     async for raw in ws:
                         try:
@@ -322,8 +346,8 @@ class MarketDataEngine:
                                             try:
                                                 mid = float(o)
                                                 self._apply_bbo(mid*0.9999, mid*1.0001, None)
-                                            except Exception:
-                                                pass
+                                            except (ValueError, TypeError):
+                                                log.debug("oracle price parse failed for %s", m)
                         except Exception as e:
                             log.error("WS parse error %s", e)
             except asyncio.CancelledError:
@@ -332,25 +356,3 @@ class MarketDataEngine:
                 log.error("WS disconnect %s backoff %.1f", type(e).__name__, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30)
-            # REST live polling every 1s for all pairs (BBO -> livePrices -> markets)
-            try:
-                await self._fetch_rest_snapshot()
-                # also poll livePrices for this market
-                try:
-                    lp = await self._client.get_live_prices()
-                    # livePrices shape: {prices: [{market:"BTC-USD", bid, ask}]}
-                    lst = lp.get("prices") or lp.get("markets") or []
-                    for p in lst if isinstance(lst, list) else []:
-                        if isinstance(p, dict) and (p.get("market")==self.market or p.get("marketDisplayName")==self.market):
-                            bid = p.get("bid") or p.get("bestBid")
-                            ask = p.get("ask") or p.get("bestAsk")
-                            if bid and ask:
-                                self._apply_bbo(float(bid), float(ask), None)
-                                break
-                except Exception:
-                    pass
-            except Exception:
-                pass
-            if self.is_stale():
-                log.warning(MARKET_DATA_STALE + " %s", self.market)
-            await asyncio.sleep(1)

@@ -66,7 +66,9 @@ class Settings(BaseSettings):
     account_balance: float = Field(default=100.0, alias="ACCOUNT_BALANCE")
     leverage: int = Field(default=10, alias="LEVERAGE")
     take_profit_usd: float = Field(default=0.015, alias="TAKE_PROFIT_USD")
-    stop_loss_usd: float = Field(default=0.009, alias="STOP_LOSS_USD")
+    stop_loss_usd: float = Field(default=0.01, alias="STOP_LOSS_USD")
+    # Hard equity floor: if equity drops to/below this the bot halts (no negative balances)
+    equity_floor_usd: float = Field(default=0.0, alias="EQUITY_FLOOR_USD")
     strategy_preset: str = Field(default="guru", alias="STRATEGY_PRESET")
     supported_markets: str = Field(
         default="BTC-USD,ETH-USD,SOL-USD,NVDA-USD,TSLA-USD", alias="SUPPORTED_MARKETS"

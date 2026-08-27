@@ -291,8 +291,8 @@ async def update_settings(payload: dict[str, Any]) -> JSONResponse:
                 setattr(settings, k, iv)
                 settings.order_size_usd = settings.margin_usd * iv
                 continue
-            # SL must be <0.01 strict sub-cent
-            if k == "stop_loss_usd" and float(v) >= 0.01:
+            # SL hard-capped at 0.01 (max -0.01 loss per cycle, never worse)
+            if k == "stop_loss_usd" and (float(v) <= 0 or float(v) > 0.01):
                 continue
             # TP 0.01-0.02
             if k == "take_profit_usd" and not (0.01 <= float(v) <= 0.02):
