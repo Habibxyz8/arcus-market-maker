@@ -422,8 +422,8 @@ class PaperEngine:
         if mid is not None and self.base_inventory != 0 and self._entry_price is not None:
             direction = 1 if self.base_inventory > 0 else -1
             unreal = direction * (mid - self._entry_price) * abs(self.base_inventory)
-        elif mid is not None:
-            unreal = self.base_inventory * mid + self.quote_balance - self.initial_balance - self.realized_pnl
+        # NOTE: equity/unrealized is derived solely from inventory+entry, never from
+        # quote_balance (which is a noisy running cash tally in simulation).
         return self.realized_pnl + unreal - fees
 
     def cpm(self, mid: float | None = None) -> float:
@@ -439,8 +439,6 @@ class PaperEngine:
         elif mid is not None and self._entry_price is not None:
             direction = 1 if self.base_inventory > 0 else -1
             unreal = direction * (mid - self._entry_price) * abs(self.base_inventory)
-        elif mid is not None:
-            unreal = self.base_inventory * mid + self.quote_balance - self.initial_balance - self.realized_pnl
         else:
             unreal = 0.0
         net = self.realized_pnl + unreal - fees
